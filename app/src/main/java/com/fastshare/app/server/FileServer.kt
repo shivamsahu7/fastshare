@@ -45,6 +45,20 @@ class FileServer(
     var isPeerConnected: Boolean = false
         private set
 
+    @Volatile
+    var isDisconnecting: Boolean = false
+        private set
+
+    @Volatile
+    var lastPeerActivityTime: Long = System.currentTimeMillis()
+
+    fun notifyDisconnect() {
+        if (isDisconnecting) return
+        isDisconnecting = true
+        isPeerConnected = false
+        onPeerDisconnected?.invoke()
+    }
+
     private val itemsList = CopyOnWriteArrayList<SharedFileItem>(initialBatch.items)
     private val fileMap = ConcurrentHashMap<String, SharedFileItem>()
     private var overallBytesSent = 0L
@@ -84,9 +98,20 @@ class FileServer(
     fun getReceivedFiles(): List<ReceivedFile> = receivedFilesList.toList()
 
     override fun serve(session: IHTTPSession): Response {
+        lastPeerActivityTime = System.currentTimeMillis()
         val uri = session.uri
         val parms = session.parameters
         val currentItems = itemsList.toList()
+
+        if (isDisconnecting && uri != "/disconnect") {
+            val respObj = JSONObject().apply {
+                put("status", "disconnected")
+                put("message", "Server is disconnected")
+            }
+            val resp = newFixedLengthResponse(Response.Status.GONE, "application/json", respObj.toString())
+            resp.addHeader("Access-Control-Allow-Origin", "*")
+            return resp
+        }
 
         return when {
             (uri == "/upload" || uri.startsWith("/upload")) && session.method == Method.POST -> {
@@ -173,11 +198,13 @@ class FileServer(
             uri == "/connect" || uri == "/ping" -> {
                 isPeerConnected = true
                 val remoteIp = session.remoteIpAddress ?: "Peer Device"
-                onPeerConnected?.invoke(remoteIp)
+                val deviceName = session.headers["x-device-name"] ?: session.parameters["device"]?.firstOrNull() ?: remoteIp
+                onPeerConnected?.invoke(deviceName)
                 val respObj = JSONObject().apply {
                     put("status", "ok")
                     put("connected", true)
                     put("serverTitle", initialBatch.title)
+                    put("deviceName", android.os.Build.MODEL)
                     put("filesCount", currentItems.size)
                 }
                 val resp = newFixedLengthResponse(Response.Status.OK, "application/json", respObj.toString())
@@ -199,7 +226,8 @@ class FileServer(
             uri == "/manifest" || uri == "/info" -> {
                 if (!isPeerConnected) {
                     isPeerConnected = true
-                    onPeerConnected?.invoke(session.remoteIpAddress ?: "Peer Device")
+                    val deviceName = session.headers["x-device-name"] ?: session.parameters["device"]?.firstOrNull() ?: (session.remoteIpAddress ?: "Peer Device")
+                    onPeerConnected?.invoke(deviceName)
                 }
                 val jsonArray = JSONArray()
                 for (item in currentItems) {

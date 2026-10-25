@@ -23,6 +23,12 @@ import java.util.concurrent.TimeUnit
 
 class FileDownloader(private val context: Context) {
 
+    val completedFileIds = java.util.Collections.synchronizedSet(HashSet<String>())
+
+    fun clearSession() {
+        completedFileIds.clear()
+    }
+
     private class HighSpeedSocketFactory : javax.net.SocketFactory() {
         private val delegate = javax.net.SocketFactory.getDefault()
         override fun createSocket(): java.net.Socket = configure(delegate.createSocket())
@@ -101,13 +107,31 @@ class FileDownloader(private val context: Context) {
         }
 
         try {
-            // 1. Fetch Manifest
+            // 1. Fetch Manifest with peer device name header
+            val deviceModel = "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}".trim()
             val manifestRequest = Request.Builder()
                 .url("$cleanUrl/manifest")
+                .header("x-device-name", deviceModel)
                 .get()
                 .build()
 
-            val manifestResponse = client.newCall(manifestRequest).execute()
+            val manifestResponse = try {
+                client.newBuilder()
+                    .connectTimeout(2500, TimeUnit.MILLISECONDS)
+                    .readTimeout(3000, TimeUnit.MILLISECONDS)
+                    .retryOnConnectionFailure(false)
+                    .build()
+                    .newCall(manifestRequest)
+                    .execute()
+            } catch (e: Exception) {
+                callback.onError("PEER_DISCONNECTED")
+                return@withContext
+            }
+
+            if (manifestResponse.code == 410) {
+                callback.onError("PEER_DISCONNECTED")
+                return@withContext
+            }
             if (!manifestResponse.isSuccessful) {
                 callback.onError("Failed to fetch batch manifest: HTTP ${manifestResponse.code}")
                 return@withContext
@@ -120,13 +144,28 @@ class FileDownloader(private val context: Context) {
             }
 
             val manifest = JSONObject(manifestJsonStr)
+            if (manifest.optString("status") == "disconnected") {
+                callback.onError("PEER_DISCONNECTED")
+                return@withContext
+            }
             val batchTitle = manifest.optString("title", "FastShare_Download")
             val totalSize = manifest.optLong("totalSize", 0L)
             val filesArray = manifest.getJSONArray("files")
             val totalFiles = filesArray.length()
 
-            if (totalFiles == 0) {
-                callback.onError("No files in batch")
+            // Filter for files not yet downloaded in this session
+            val pendingIndices = mutableListOf<Int>()
+            for (i in 0 until totalFiles) {
+                val item = filesArray.getJSONObject(i)
+                val id = item.getString("id")
+                if (!completedFileIds.contains(id)) {
+                    pendingIndices.add(i)
+                }
+            }
+
+            if (pendingIndices.isEmpty()) {
+                // Not an error! Devices are connected and ready, all currently queued files are downloaded.
+                callback.onBatchSuccess(batchTitle, 0, 0L, "")
                 return@withContext
             }
 
@@ -138,8 +177,8 @@ class FileDownloader(private val context: Context) {
             var overallBytesDownloaded = 0L
             var lastUpdateTime = System.currentTimeMillis()
 
-            // 2. Download each file in the batch (with auto-resume and auto-retry)
-            for (i in 0 until totalFiles) {
+            // 2. Download each pending file (with auto-resume and auto-retry)
+            for ((seqIdx, i) in pendingIndices.withIndex()) {
                 val item = filesArray.getJSONObject(i)
                 val id = item.getString("id")
                 val name = item.getString("name")
@@ -152,28 +191,20 @@ class FileDownloader(private val context: Context) {
 
                 // Check if this file was already completely downloaded in a previous attempt
                 if (completedMarkerFile.exists()) {
+                    completedFileIds.add(id)
                     overallBytesDownloaded += fileSize
-                    val progress = if (totalSize > 0) (overallBytesDownloaded.toFloat() / totalSize.toFloat()).coerceIn(0f, 1f) else 1f
-                    callback.onProgress(
-                        currentFileName = name,
-                        currentFileIndex = i + 1,
-                        totalFiles = totalFiles,
-                        currentFileBytes = fileSize,
-                        currentFileSize = fileSize,
-                        overallBytes = overallBytesDownloaded,
-                        overallTotalBytes = totalSize,
-                        speedMbPerSec = 0.0,
-                        progress = progress
-                    )
+                    val savedPath = "Downloads/$targetDirName/$relativePath"
+                    callback.onFileDownloaded(name, fileSize, savedPath)
                     continue
                 }
 
                 // If partFile is already equal to fileSize, finalize it
                 if (partFile.exists() && partFile.length() == fileSize && fileSize > 0) {
-                    saveCompletedFile(partFile, relativePath, name, mimeType, targetDirName)
+                    val savedPath = saveCompletedFile(partFile, relativePath, name, mimeType, targetDirName)
                     try { completedMarkerFile.createNewFile() } catch (ignored: Exception) {}
+                    completedFileIds.add(id)
                     overallBytesDownloaded += fileSize
-                    callback.onFileDownloaded(name, fileSize, partFile.name)
+                    callback.onFileDownloaded(name, fileSize, savedPath)
                     continue
                 }
 
@@ -267,10 +298,11 @@ class FileDownloader(private val context: Context) {
                             }
 
                             // Successfully completed this file -> save to user's Downloads folder
-                            saveCompletedFile(partFile, relativePath, name, mimeType, targetDirName)
+                            val savedPath = saveCompletedFile(partFile, relativePath, name, mimeType, targetDirName)
                             try { completedMarkerFile.createNewFile() } catch (ignored: Exception) {}
+                            completedFileIds.add(id)
                             fileDownloadedSuccessfully = true
-                            callback.onFileDownloaded(name, fileSize, partFile.name)
+                            callback.onFileDownloaded(name, fileSize, savedPath)
                         }
                     } catch (e: Exception) {
                         lastException = e
@@ -287,23 +319,14 @@ class FileDownloader(private val context: Context) {
                 }
             }
 
-            // Cleanup temp directory after complete batch success
-            try {
-                tempDir.listFiles()?.forEach { file ->
-                    if (file.name.startsWith(cleanBatchPrefix)) {
-                        file.delete()
-                    }
-                }
-            } catch (ignored: Exception) {}
-
             TransferService.update(
                 context,
                 title = "FastShare: Transfer Complete",
-                message = "Saved $totalFiles file(s) to Downloads/$targetDirName",
+                message = "Saved ${pendingIndices.size} file(s) to Downloads/$targetDirName",
                 progress = 100
             )
 
-            callback.onBatchSuccess(batchTitle, totalFiles, overallBytesDownloaded, "Downloads/$targetDirName")
+            callback.onBatchSuccess(batchTitle, pendingIndices.size, overallBytesDownloaded, "Downloads/$targetDirName")
         } catch (e: Exception) {
             callback.onError("Download error: ${e.localizedMessage ?: e.message}")
         } finally {
@@ -327,7 +350,8 @@ class FileDownloader(private val context: Context) {
         name: String,
         mimeType: String,
         targetDirName: String
-    ) {
+    ): String {
+        val destRelativePath = "Downloads/$targetDirName/$relativePath"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val subFolder = if (relativePath.contains("/")) {
                 val parentDir = relativePath.substringBeforeLast("/")
@@ -366,5 +390,6 @@ class FileDownloader(private val context: Context) {
 
         // Delete the temporary .part file now that it's safe in destination
         try { sourceFile.delete() } catch (ignored: Exception) {}
+        return destRelativePath
     }
 }

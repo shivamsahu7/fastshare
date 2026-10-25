@@ -76,14 +76,13 @@ fun TransferringSheet(
     val totalTransferredText = formatBytes(overallBytesTransferred)
 
     // Build the unified list of transfers
-    val unifiedList = remember(records, sentItems, receivedFiles, transferState) {
-        if (records.isNotEmpty()) {
-            records
-        } else {
-            val list = mutableListOf<TransferRecord>()
+    val unifiedList = remember(records.toList(), sentItems, receivedFiles, transferState) {
+        val list = mutableListOf<TransferRecord>()
+        list.addAll(records)
 
-            // 1. Sent / Queued items
-            sentItems.forEach { item ->
+        // Add any sentItems not already in list
+        sentItems.forEach { item ->
+            if (list.none { it.id == item.id || it.name == item.name }) {
                 val isActive = (transferState is TransferState.Transferring && transferState.currentFileName == item.name)
                 val isCompleted = (transferState is TransferState.Completed)
                 val status = when {
@@ -119,9 +118,11 @@ fun TransferringSheet(
                     )
                 )
             }
+        }
 
-            // 2. Received files
-            receivedFiles.forEach { rec ->
+        // Add any receivedFiles not already in list
+        receivedFiles.forEach { rec ->
+            if (list.none { it.name == rec.name }) {
                 list.add(
                     TransferRecord(
                         id = rec.path,
@@ -135,28 +136,31 @@ fun TransferringSheet(
                     )
                 )
             }
+        }
 
-            // 3. Active receiving item from transferState if not already in list
-            if (transferState is TransferState.Transferring) {
-                val alreadyInList = list.any { it.name == transferState.currentFileName }
-                if (!alreadyInList) {
-                    list.add(
-                        0,
-                        TransferRecord(
-                            name = transferState.currentFileName,
-                            size = transferState.currentFileSize,
-                            direction = TransferDirection.RECEIVING,
-                            status = TransferItemStatus.TRANSFERRING,
-                            bytesTransferred = transferState.currentFileBytes,
-                            progress = transferState.progress,
-                            speedMbPerSec = transferState.speedMbPerSec
-                        )
+        // Active receiving item from transferState if not already in list
+        if (transferState is TransferState.Transferring) {
+            val alreadyInList = list.any { it.name == transferState.currentFileName }
+            if (!alreadyInList) {
+                list.add(
+                    0,
+                    TransferRecord(
+                        name = transferState.currentFileName,
+                        size = transferState.currentFileSize,
+                        direction = TransferDirection.RECEIVING,
+                        status = TransferItemStatus.TRANSFERRING,
+                        bytesTransferred = transferState.currentFileBytes,
+                        progress = transferState.progress,
+                        speedMbPerSec = transferState.speedMbPerSec
                     )
-                }
+                )
             }
+        }
 
-            // 4. Failed transfer representation if error
-            if (transferState is TransferState.Error) {
+        // Failed transfer representation if error
+        if (transferState is TransferState.Error) {
+            val alreadyHasError = list.any { it.status == TransferItemStatus.FAILED }
+            if (!alreadyHasError) {
                 list.add(
                     0,
                     TransferRecord(
@@ -168,9 +172,9 @@ fun TransferringSheet(
                     )
                 )
             }
-
-            list
         }
+
+        list
     }
 
     Column(

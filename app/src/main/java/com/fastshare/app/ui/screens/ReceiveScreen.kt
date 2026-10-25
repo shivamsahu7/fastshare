@@ -37,6 +37,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import com.fastshare.app.client.FileDownloader
 import com.fastshare.app.client.FileUploader
 import com.fastshare.app.client.WifiConnector
@@ -153,121 +156,175 @@ fun ReceiveScreen(
         }
     }
 
+    var isDownloadLoopActive by remember { mutableStateOf(false) }
+
+    fun handlePeerDisconnected() {
+        if (!isDownloadLoopActive && connectedServerUrl.isEmpty() && transferState is TransferState.Idle) return
+        isDownloadLoopActive = false
+        connectedServerUrl = ""
+        fileDownloader.clearSession()
+        try { wifiConnector.disconnect() } catch (ignored: Exception) {}
+        TransferService.stop(context)
+        transferState = TransferState.Idle
+        uploadState = TransferState.Idle
+        selectedUploadItems.clear()
+        Toast.makeText(context, "Peer device disconnected", Toast.LENGTH_SHORT).show()
+    }
+
+    LaunchedEffect(wifiConnector) {
+        wifiConnector.onNetworkLost = {
+            coroutineScope.launch(Dispatchers.Main) {
+                handlePeerDisconnected()
+            }
+        }
+    }
+
     fun startDownload(serverUrl: String) {
         connectedServerUrl = serverUrl
-        transferState = TransferState.Starting("Fetching files manifest...")
-        showTransferringSheet = true
+        if (isDownloadLoopActive) return
+        isDownloadLoopActive = true
+
         coroutineScope.launch {
-            fileDownloader.downloadBatch(
-                serverBaseUrl = serverUrl,
-                callback = object : FileDownloader.BatchDownloadCallback {
-                    override fun onProgress(
-                        currentFileName: String,
-                        currentFileIndex: Int,
-                        totalFiles: Int,
-                        currentFileBytes: Long,
-                        currentFileSize: Long,
-                        overallBytes: Long,
-                        overallTotalBytes: Long,
-                        speedMbPerSec: Double,
-                        progress: Float
-                    ) {
-                        transferState = TransferState.Transferring(
-                            currentFileName = currentFileName,
-                            currentFileIndex = currentFileIndex,
-                            totalFiles = totalFiles,
-                            currentFileBytes = currentFileBytes,
-                            currentFileSize = currentFileSize,
-                            overallBytes = overallBytes,
-                            overallTotalBytes = overallTotalBytes,
-                            speedMbPerSec = speedMbPerSec,
-                            progress = progress
-                        )
-
-                        val existingIndex = receiverTransferRecords.indexOfFirst {
-                            it.name == currentFileName && it.direction == TransferDirection.RECEIVING
-                        }
-                        if (existingIndex >= 0) {
-                            val cur = receiverTransferRecords[existingIndex]
-                            receiverTransferRecords[existingIndex] = cur.copy(
-                                status = TransferItemStatus.TRANSFERRING,
-                                bytesTransferred = currentFileBytes,
-                                progress = progress,
-                                speedMbPerSec = speedMbPerSec
-                            )
-                        } else {
-                            receiverTransferRecords.add(
-                                0,
-                                TransferRecord(
-                                    name = currentFileName,
-                                    size = currentFileSize,
-                                    direction = TransferDirection.RECEIVING,
-                                    status = TransferItemStatus.TRANSFERRING,
-                                    bytesTransferred = currentFileBytes,
-                                    progress = progress,
-                                    speedMbPerSec = speedMbPerSec
+            var consecutiveErrors = 0
+            while (isDownloadLoopActive && connectedServerUrl.isNotEmpty()) {
+                try {
+                    fileDownloader.downloadBatch(
+                        serverBaseUrl = connectedServerUrl,
+                        callback = object : FileDownloader.BatchDownloadCallback {
+                            override fun onProgress(
+                                currentFileName: String,
+                                currentFileIndex: Int,
+                                totalFiles: Int,
+                                currentFileBytes: Long,
+                                currentFileSize: Long,
+                                overallBytes: Long,
+                                overallTotalBytes: Long,
+                                speedMbPerSec: Double,
+                                progress: Float
+                            ) {
+                                consecutiveErrors = 0
+                                transferState = TransferState.Transferring(
+                                    currentFileName = currentFileName,
+                                    currentFileIndex = currentFileIndex,
+                                    totalFiles = totalFiles,
+                                    currentFileBytes = currentFileBytes,
+                                    currentFileSize = currentFileSize,
+                                    overallBytes = overallBytes,
+                                    overallTotalBytes = overallTotalBytes,
+                                    speedMbPerSec = speedMbPerSec,
+                                    progress = progress
                                 )
-                            )
-                        }
-                    }
 
-                    override fun onFileDownloaded(fileName: String, fileSize: Long, filePath: String) {
-                        val existingIndex = receiverTransferRecords.indexOfFirst {
-                            it.name == fileName && it.direction == TransferDirection.RECEIVING
-                        }
-                        if (existingIndex >= 0) {
-                            val cur = receiverTransferRecords[existingIndex]
-                            receiverTransferRecords[existingIndex] = cur.copy(
-                                status = TransferItemStatus.COMPLETED,
-                                bytesTransferred = fileSize,
-                                progress = 1f,
-                                path = filePath
-                            )
-                        } else {
-                            receiverTransferRecords.add(
-                                TransferRecord(
-                                    name = fileName,
-                                    size = fileSize,
-                                    direction = TransferDirection.RECEIVING,
-                                    status = TransferItemStatus.COMPLETED,
-                                    bytesTransferred = fileSize,
-                                    progress = 1f,
-                                    path = filePath
-                                )
-                            )
-                        }
-                    }
+                                val existingIndex = receiverTransferRecords.indexOfFirst {
+                                    it.name == currentFileName && it.direction == TransferDirection.RECEIVING
+                                }
+                                if (existingIndex >= 0) {
+                                    val cur = receiverTransferRecords[existingIndex]
+                                    receiverTransferRecords[existingIndex] = cur.copy(
+                                        status = TransferItemStatus.TRANSFERRING,
+                                        bytesTransferred = currentFileBytes,
+                                        progress = progress,
+                                        speedMbPerSec = speedMbPerSec
+                                    )
+                                } else {
+                                    receiverTransferRecords.add(
+                                        0,
+                                        TransferRecord(
+                                            name = currentFileName,
+                                            size = currentFileSize,
+                                            direction = TransferDirection.RECEIVING,
+                                            status = TransferItemStatus.TRANSFERRING,
+                                            bytesTransferred = currentFileBytes,
+                                            progress = progress,
+                                            speedMbPerSec = speedMbPerSec
+                                        )
+                                    )
+                                }
+                            }
 
-                    override fun onBatchSuccess(
-                        title: String,
-                        fileCount: Int,
-                        totalBytes: Long,
-                        targetDirectory: String
-                    ) {
-                        TransferService.stop(context)
-                        transferState = TransferState.Completed(
-                            title = title,
-                            fileCount = fileCount,
-                            totalBytes = totalBytes,
-                            destinationPath = targetDirectory
-                        )
-                    }
+                            override fun onFileDownloaded(fileName: String, fileSize: Long, filePath: String) {
+                                consecutiveErrors = 0
+                                val existingIndex = receiverTransferRecords.indexOfFirst {
+                                    it.name == fileName && it.direction == TransferDirection.RECEIVING
+                                }
+                                if (existingIndex >= 0) {
+                                    val cur = receiverTransferRecords[existingIndex]
+                                    receiverTransferRecords[existingIndex] = cur.copy(
+                                        status = TransferItemStatus.COMPLETED,
+                                        bytesTransferred = fileSize,
+                                        progress = 1f,
+                                        path = filePath
+                                    )
+                                } else {
+                                    receiverTransferRecords.add(
+                                        0,
+                                        TransferRecord(
+                                            name = fileName,
+                                            size = fileSize,
+                                            direction = TransferDirection.RECEIVING,
+                                            status = TransferItemStatus.COMPLETED,
+                                            bytesTransferred = fileSize,
+                                            progress = 1f,
+                                            path = filePath
+                                        )
+                                    )
+                                }
+                            }
 
-                    override fun onError(message: String) {
-                        transferState = TransferState.Error(message)
-                        val activeIdx = receiverTransferRecords.indexOfFirst {
-                            it.status == TransferItemStatus.TRANSFERRING && it.direction == TransferDirection.RECEIVING
+                            override fun onBatchSuccess(
+                                title: String,
+                                fileCount: Int,
+                                totalBytes: Long,
+                                targetDirectory: String
+                            ) {
+                                consecutiveErrors = 0
+                                if (fileCount > 0) {
+                                    transferState = TransferState.Completed(
+                                        title = title,
+                                        fileCount = fileCount,
+                                        totalBytes = totalBytes,
+                                        destinationPath = targetDirectory
+                                    )
+                                }
+                            }
+
+                            override fun onError(message: String) {
+                                if (message == "PEER_DISCONNECTED") {
+                                    coroutineScope.launch(Dispatchers.Main) {
+                                        handlePeerDisconnected()
+                                    }
+                                    return
+                                }
+                                consecutiveErrors++
+                                val activeIdx = receiverTransferRecords.indexOfFirst {
+                                    it.status == TransferItemStatus.TRANSFERRING && it.direction == TransferDirection.RECEIVING
+                                }
+                                if (activeIdx >= 0) {
+                                    val cur = receiverTransferRecords[activeIdx]
+                                    receiverTransferRecords[activeIdx] = cur.copy(
+                                        status = TransferItemStatus.FAILED,
+                                        errorMessage = message
+                                    )
+                                }
+                                if (consecutiveErrors >= 2) {
+                                    coroutineScope.launch(Dispatchers.Main) {
+                                        handlePeerDisconnected()
+                                    }
+                                }
+                            }
                         }
-                        if (activeIdx >= 0) {
-                            val cur = receiverTransferRecords[activeIdx]
-                            receiverTransferRecords[activeIdx] = cur.copy(
-                                status = TransferItemStatus.FAILED,
-                                errorMessage = message
-                            )
+                    )
+                } catch (e: Exception) {
+                    consecutiveErrors++
+                    if (consecutiveErrors >= 2) {
+                        coroutineScope.launch(Dispatchers.Main) {
+                            handlePeerDisconnected()
                         }
                     }
                 }
-            )
+                delay(1200)
+            }
+            isDownloadLoopActive = false
         }
     }
 
@@ -441,9 +498,25 @@ fun ReceiveScreen(
             confirmButtonText = "Disconnect & Exit",
             onConfirm = {
                 showReceiverDisconnectDialog = false
-                try {
-                    wifiConnector.disconnect()
-                } catch (ignored: Exception) {}
+                isDownloadLoopActive = false
+                fileDownloader.clearSession()
+                val targetUrl = connectedServerUrl
+                connectedServerUrl = ""
+                coroutineScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                    if (targetUrl.isNotEmpty()) {
+                        try {
+                            val discUrl = java.net.URL("$targetUrl/disconnect")
+                            val conn = discUrl.openConnection() as java.net.HttpURLConnection
+                            conn.connectTimeout = 1500
+                            conn.readTimeout = 1500
+                            conn.requestMethod = "GET"
+                            conn.responseCode
+                        } catch (ignored: Exception) {}
+                    }
+                    try {
+                        wifiConnector.disconnect()
+                    } catch (ignored: Exception) {}
+                }
                 TransferService.stop(context)
                 transferState = TransferState.Idle
                 uploadState = TransferState.Idle
@@ -502,7 +575,7 @@ fun ReceiveScreen(
             }
 
             // Disconnect Button with Cross Icon (prominent red badge)
-            val isConnectedToHost = isSessionActive || (connectedServerUrl.isNotEmpty() && connectedServerUrl != "http://192.168.43.1:8080") || receiverTransferRecords.isNotEmpty()
+            val isConnectedToHost = isSessionActive || (connectedServerUrl.isNotEmpty() && isDownloadLoopActive)
             if (isConnectedToHost) {
                 Surface(
                     onClick = { showReceiverDisconnectDialog = true },

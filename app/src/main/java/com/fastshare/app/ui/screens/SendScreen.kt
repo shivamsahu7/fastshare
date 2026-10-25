@@ -25,6 +25,9 @@ import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -119,6 +122,13 @@ fun SendScreen(
     val mediaRepo = remember { MediaRepository(context) }
     val fileUploader = remember { FileUploader(context) }
 
+    val categoryTabs = remember { CategoryTab.values() }
+    val pagerState = rememberPagerState(
+        initialPage = CategoryTab.APPS.ordinal,
+        pageCount = { categoryTabs.size }
+    )
+    val tabListState = rememberLazyListState()
+
     var selectedTab by remember { mutableStateOf(CategoryTab.APPS) }
     val selectedItems = remember { mutableStateMapOf<String, SharedFileItem>() }
     var searchQuery by remember { mutableStateOf("") }
@@ -138,6 +148,7 @@ fun SendScreen(
     var isLoadingDirectory by remember { mutableStateOf(false) }
 
     // Connection & Transfer States
+    var activeFileServer by remember { mutableStateOf<FileServer?>(null) }
     var isHostConnected by remember { mutableStateOf(false) }
     var isClientConnected by remember { mutableStateOf(false) }
     var connectedHostUrl by remember { mutableStateOf("http://192.168.43.1:8080") }
@@ -154,9 +165,10 @@ fun SendScreen(
     var showQrScanner by remember { mutableStateOf(false) }
     var showTransferringSheet by remember { mutableStateOf(false) }
     var showDisconnectDialog by remember { mutableStateOf(false) }
+    var peerDeviceName by remember { mutableStateOf("") }
     val sessionTransferRecords = remember { mutableStateListOf<TransferRecord>() }
 
-    val isConnected = isHostConnected || isClientConnected || (fileServer?.isPeerConnected == true)
+    val isConnected = isHostConnected || isClientConnected || ((activeFileServer ?: fileServer)?.isPeerConnected == true)
     val activeTransferState = if (isClientConnected) clientTransferState else transferState
 
     // Permission check for Photos & Videos (including Android 14 visual user selected)
@@ -189,9 +201,21 @@ fun SendScreen(
         }
     }
 
+    LaunchedEffect(pagerState.currentPage) {
+        val tab = categoryTabs[pagerState.currentPage]
+        if (selectedTab != tab) {
+            selectedTab = tab
+            searchQuery = ""
+        }
+        tabListState.animateScrollToItem(pagerState.currentPage)
+    }
+
+    LaunchedEffect(Unit) {
+        if (appsList.isEmpty()) appsList = mediaRepo.loadInstalledApps()
+    }
+
     // Load data based on tab
     LaunchedEffect(selectedTab) {
-        isLoadingMedia = true
         when (selectedTab) {
             CategoryTab.APPS -> if (appsList.isEmpty()) appsList = mediaRepo.loadInstalledApps()
             CategoryTab.PHOTOS -> if (photosList.isEmpty()) photosList = mediaRepo.loadPhotos()
@@ -208,7 +232,6 @@ fun SendScreen(
             CategoryTab.CONTACTS -> if (contactsList.isEmpty()) contactsList = mediaRepo.loadContacts()
             CategoryTab.HISTORY -> {}
         }
-        isLoadingMedia = false
     }
 
     // Load directory files when currentDirectory changes
@@ -233,6 +256,72 @@ fun SendScreen(
     val liveSpeed: Double = when (val state = activeTransferState) {
         is TransferState.Transferring -> state.speedMbPerSec
         else -> 0.0
+    }
+
+    fun disconnectDevice(notifyPeer: Boolean = true, toastMessage: String = "Device Disconnected") {
+        val s = activeFileServer ?: fileServer
+        if (s != null) {
+            if (notifyPeer) {
+                s.notifyDisconnect()
+            }
+            coroutineScope.launch {
+                if (notifyPeer) {
+                    kotlinx.coroutines.delay(500)
+                }
+                try { s.stop() } catch (ignored: Exception) {}
+                hotspotManager.stopHotspot()
+                onStopSharing()
+                activeFileServer = null
+            }
+        }
+        if (isClientConnected) {
+            if (notifyPeer && connectedHostUrl.isNotEmpty()) {
+                coroutineScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                    try {
+                        val discUrl = java.net.URL("$connectedHostUrl/disconnect")
+                        val conn = discUrl.openConnection() as java.net.HttpURLConnection
+                        conn.connectTimeout = 1500
+                        conn.readTimeout = 1500
+                        conn.requestMethod = "GET"
+                        conn.responseCode
+                    } catch (ignored: Exception) {}
+                }
+            }
+            wifiConnector.disconnect()
+        }
+        isHostConnected = false
+        isClientConnected = false
+        peerDeviceName = ""
+        clientTransferState = TransferState.Idle
+        showTransferringSheet = false
+        selectedItems.clear()
+        Toast.makeText(context, toastMessage, Toast.LENGTH_SHORT).show()
+    }
+
+    LaunchedEffect(wifiConnector) {
+        wifiConnector.onNetworkLost = {
+            if (isClientConnected) {
+                coroutineScope.launch(kotlinx.coroutines.Dispatchers.Main) {
+                    disconnectDevice(notifyPeer = false, toastMessage = "Peer device disconnected")
+                }
+            }
+        }
+    }
+
+    LaunchedEffect(isHostConnected, activeFileServer) {
+        if (isHostConnected) {
+            while (isHostConnected) {
+                kotlinx.coroutines.delay(2000)
+                val s = activeFileServer ?: fileServer
+                if (s != null && s.isPeerConnected) {
+                    val silenceDuration = System.currentTimeMillis() - s.lastPeerActivityTime
+                    if (silenceDuration > 8000L) {
+                        disconnectDevice(notifyPeer = false, toastMessage = "Peer device disconnected")
+                        break
+                    }
+                }
+            }
+        }
     }
 
     // Flow Functions
@@ -338,14 +427,17 @@ fun SendScreen(
                     }
                 )
                 serverInstance = server
+                activeFileServer = server
 
-                server.onPeerConnected = {
+                server.onPeerConnected = { remoteName ->
                     isHostConnected = true
+                    peerDeviceName = remoteName
                     showQrModal = false
-                    showTransferringSheet = true
                 }
                 server.onPeerDisconnected = {
-                    isHostConnected = false
+                    coroutineScope.launch(kotlinx.coroutines.Dispatchers.Main) {
+                        disconnectDevice(notifyPeer = false, toastMessage = "Peer device disconnected")
+                    }
                 }
                 server.onFileReceived = { name, size, path ->
                     serverReceivedFiles.add(ReceivedFile(name, size, path))
@@ -563,7 +655,6 @@ fun SendScreen(
                 callback = object : WifiConnector.ConnectionCallback {
                     override fun onConnected(network: Network?) {
                         isClientConnected = true
-                        showTransferringSheet = true
 
                         coroutineScope.launch {
                             try {
@@ -572,13 +663,23 @@ fun SendScreen(
                                 conn.connectTimeout = 3000
                                 conn.readTimeout = 3000
                                 conn.requestMethod = "GET"
-                                conn.responseCode
+                                conn.setRequestProperty("x-device-name", android.os.Build.MODEL)
+                                if (conn.responseCode == 200) {
+                                    val resp = conn.inputStream.bufferedReader().readText()
+                                    val json = JSONObject(resp)
+                                    val remoteModel = json.optString("deviceName", "Peer Device")
+                                    peerDeviceName = remoteModel
+                                    val count = json.optInt("filesCount", 0)
+                                    if (count > 0) {
+                                        startClientDownload(serverUrl)
+                                    } else {
+                                        clientTransferState = TransferState.Idle
+                                    }
+                                }
                             } catch (e: Exception) {
                                 e.printStackTrace()
                             }
                         }
-
-                        startClientDownload(serverUrl)
                     }
 
                     override fun onFailure(reason: String) {
@@ -702,32 +803,6 @@ fun SendScreen(
         }
     }
 
-    fun disconnectDevice() {
-        if (fileServer != null) {
-            try { fileServer.stop() } catch (ignored: Exception) {}
-            hotspotManager.stopHotspot()
-            onStopSharing()
-        }
-        if (isClientConnected) {
-            coroutineScope.launch {
-                try {
-                    val discUrl = java.net.URL("$connectedHostUrl/disconnect")
-                    val conn = discUrl.openConnection() as java.net.HttpURLConnection
-                    conn.connectTimeout = 2000
-                    conn.readTimeout = 2000
-                    conn.requestMethod = "GET"
-                    conn.responseCode
-                } catch (ignored: Exception) {}
-            }
-            wifiConnector.disconnect()
-        }
-        isHostConnected = false
-        isClientConnected = false
-        clientTransferState = TransferState.Idle
-        showTransferringSheet = false
-        Toast.makeText(context, "Device Disconnected", Toast.LENGTH_SHORT).show()
-    }
-
     Box(modifier = modifier.fillMaxSize().background(BgVoid)) {
         Column(modifier = Modifier.fillMaxSize()) {
 
@@ -737,18 +812,9 @@ fun SendScreen(
                     .fillMaxWidth()
                     .background(XenderGreen)
                     .statusBarsPadding()
-                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Icon(
-                    imageVector = Icons.Default.Menu,
-                    contentDescription = "Menu",
-                    tint = Color.White,
-                    modifier = Modifier.size(26.dp)
-                )
-
-                Spacer(modifier = Modifier.width(14.dp))
-
                 Text(
                     text = "Transfer",
                     fontSize = 20.sp,
@@ -847,7 +913,7 @@ fun SendScreen(
                     Icon(
                         imageVector = if (ThemeState.isDarkMode) Icons.Default.WbSunny else Icons.Default.Brightness4,
                         contentDescription = "Toggle Theme",
-                        tint = Color.White,
+                        tint = if (ThemeState.isDarkMode) AccentAmber else AccentPurple,
                         modifier = Modifier.size(20.dp)
                     )
                 }
@@ -856,9 +922,13 @@ fun SendScreen(
             // 2. Category Tabs Row (Images 1-4)
             CategoryTabBar(
                 selectedTab = selectedTab,
+                listState = tabListState,
                 onSelectTab = {
                     selectedTab = it
                     searchQuery = ""
+                    coroutineScope.launch {
+                        pagerState.animateScrollToPage(it.ordinal)
+                    }
                 }
             )
 
@@ -912,15 +982,13 @@ fun SendScreen(
                 }
             }
 
-            // Loading Indicator
-            if (isLoadingMedia) {
-                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    CircularProgressIndicator(color = RubyRed)
-                }
-            } else {
-                // Category Content
-                Box(modifier = Modifier.weight(1f)) {
-                    when (selectedTab) {
+            // Category Content with smooth horizontal swipe gestures
+            HorizontalPager(
+                state = pagerState,
+                modifier = Modifier.weight(1f)
+            ) { page ->
+                val pageTab = categoryTabs[page]
+                when (pageTab) {
                         CategoryTab.APPS -> {
                             val filteredApps = if (searchQuery.isEmpty()) appsList else appsList.filter {
                                 it.name.contains(searchQuery, ignoreCase = true)
@@ -1158,7 +1226,6 @@ fun SendScreen(
                         }
                     }
                 }
-            }
 
 
             // ---------------------------------------------------------------------------------
@@ -1239,16 +1306,68 @@ fun SendScreen(
                 }
             } else {
                 // When connected:
-                // Option to send more selected files to peer
+                // 1. If files are selected, show floating Send bar
                 if (totalSelectedCount > 0) {
                     Surface(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 6.dp),
-                        shape = RoundedCornerShape(24.dp),
-                        color = SurfaceElevated,
-                        shadowElevation = 8.dp,
-                        border = androidx.compose.foundation.BorderStroke(1.5.dp, XenderGreenLight)
+                            .padding(horizontal = 14.dp, vertical = 6.dp),
+                        shape = RoundedCornerShape(20.dp),
+                        color = SurfaceElevated.copy(alpha = 0.98f),
+                        shadowElevation = 10.dp,
+                        border = androidx.compose.foundation.BorderStroke(1.5.dp, RubyRedLight)
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column {
+                                Text(
+                                    text = "⚡ $totalSelectedCount items (${formatBytes(totalSelectedSize)})",
+                                    fontWeight = FontWeight.ExtraBold,
+                                    color = TextPrimary,
+                                    fontSize = 14.sp
+                                )
+                                Text(
+                                    text = "Ready to send to $peerDeviceName",
+                                    fontSize = 11.sp,
+                                    color = TextSecondary
+                                )
+                            }
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                TextButton(onClick = { selectedItems.clear() }) {
+                                    Text("Clear", color = Color(0xFFEF4444), fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                }
+                                Spacer(Modifier.width(6.dp))
+                                Button(
+                                    onClick = { sendSelectedToPeer() },
+                                    colors = ButtonDefaults.buttonColors(containerColor = RubyRed),
+                                    shape = RoundedCornerShape(14.dp),
+                                    contentPadding = PaddingValues(horizontal = 18.dp, vertical = 8.dp)
+                                ) {
+                                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = null, tint = Color.White, modifier = Modifier.size(16.dp))
+                                    Spacer(Modifier.width(6.dp))
+                                    Text("SEND", fontWeight = FontWeight.ExtraBold, color = Color.White, fontSize = 13.sp)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 2. Connected Bottom Layout: Floating Transfer Button on bottom-left & Connected Devices Bar at bottom
+                Box(
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    // Sleek Connected Devices Bottom Bar (Matching user's Xender screenshot)
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .align(Alignment.BottomCenter),
+                        color = SurfaceCard,
+                        border = androidx.compose.foundation.BorderStroke(1.dp, BorderSubtle)
                     ) {
                         Row(
                             modifier = Modifier
@@ -1257,135 +1376,112 @@ fun SendScreen(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            Column {
-                                Text(
-                                    text = "$totalSelectedCount selected (${formatBytes(totalSelectedSize)})",
-                                    fontWeight = FontWeight.Bold,
-                                    fontSize = 13.sp,
-                                    color = TextPrimary
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                // Device 1 Avatar (This Device - Fox 🦊)
+                                Box(
+                                    modifier = Modifier
+                                        .size(36.dp)
+                                        .clip(CircleShape)
+                                        .background(Color(0xFFF97316)),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text("🦊", fontSize = 18.sp)
+                                }
+
+                                // Vertical Divider
+                                Box(
+                                    modifier = Modifier
+                                        .width(1.dp)
+                                        .height(20.dp)
+                                        .background(BorderSubtle)
                                 )
-                                Text(
-                                    text = "Ready to send to connected peer",
-                                    fontSize = 11.sp,
-                                    color = TextSecondary
-                                )
+
+                                // Device 2 Avatar (Peer Device - Deer 🦌)
+                                Box(
+                                    modifier = Modifier
+                                        .size(36.dp)
+                                        .clip(CircleShape)
+                                        .background(Color(0xFFEAB308)),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text("🦌", fontSize = 18.sp)
+                                }
+
+                                // Peer Device Name Pill (e.g. Pixel6a)
+                                Surface(
+                                    shape = RoundedCornerShape(12.dp),
+                                    color = SurfaceElevated,
+                                    border = androidx.compose.foundation.BorderStroke(1.dp, BorderSubtle),
+                                    modifier = Modifier.height(28.dp)
+                                ) {
+                                    Box(
+                                        contentAlignment = Alignment.Center,
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 2.dp)
+                                    ) {
+                                        Text(
+                                            text = peerDeviceName.ifEmpty { "Pixel6a" },
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = TextPrimary
+                                        )
+                                    }
+                                }
                             }
 
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                TextButton(onClick = { selectedItems.clear() }) {
-                                    Text("Clear", color = TextSecondary, fontSize = 12.sp)
-                                }
-                                Spacer(Modifier.width(4.dp))
-                                Button(
-                                    onClick = { sendSelectedToPeer() },
-                                    colors = ButtonDefaults.buttonColors(containerColor = XenderGreenLight),
-                                    shape = RoundedCornerShape(20.dp),
-                                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
-                                ) {
-                                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = null, tint = Color.White, modifier = Modifier.size(16.dp))
-                                    Spacer(Modifier.width(6.dp))
-                                    Text("SEND", fontWeight = FontWeight.Bold, color = Color.White, fontSize = 13.sp)
-                                }
+                            // Disconnect Cross Button (Right side)
+                            IconButton(
+                                onClick = { showDisconnectDialog = true },
+                                modifier = Modifier.size(34.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Close,
+                                    contentDescription = "Disconnect",
+                                    tint = TextSecondary,
+                                    modifier = Modifier.size(20.dp)
+                                )
                             }
                         }
                     }
-                }
 
-                // Requirement 5: Docked Transferring Mini-Bar with round circle showing process & percentage
-                Surface(
-                    onClick = { showTransferringSheet = true },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 14.dp, vertical = 6.dp),
-                    shape = RoundedCornerShape(18.dp),
-                    color = SurfaceElevated.copy(alpha = 0.98f),
-                    shadowElevation = 8.dp,
-                    border = androidx.compose.foundation.BorderStroke(
-                        1.5.dp,
-                        if (activeTransferState is TransferState.Transferring) RubyRedLight else BorderSubtle
-                    )
-                ) {
-                    Row(
+                    // Floating Circular Transfer Button (Bottom Left, directly above the connected bar)
+                    Surface(
+                        onClick = { showTransferringSheet = true },
+                        shape = CircleShape,
+                        color = RubyRed,
+                        border = androidx.compose.foundation.BorderStroke(2.5.dp, Color.White),
+                        shadowElevation = 10.dp,
                         modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 14.dp, vertical = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically
+                            .padding(start = 16.dp, bottom = 56.dp)
+                            .size(52.dp)
+                            .align(Alignment.BottomStart)
                     ) {
-                        // Round circle progress ring with percentage inside
-                        Box(
-                            modifier = Modifier.size(36.dp),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            CircularProgressIndicator(
-                                progress = { liveProgress },
-                                color = RubyRedLight,
-                                trackColor = BorderSubtle,
-                                strokeWidth = 3.5.dp,
-                                modifier = Modifier.fillMaxSize()
-                            )
-                            Text(
-                                text = "${(liveProgress * 100).toInt()}%",
-                                fontSize = 9.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = TextPrimary
-                            )
-                        }
-
-                        Spacer(modifier = Modifier.width(12.dp))
-
-                        Column(modifier = Modifier.weight(1f)) {
-                            when (val state = activeTransferState) {
-                                is TransferState.Transferring -> {
-                                    Text(
-                                        text = "${state.currentFileIndex}/${state.totalFiles}: ${state.currentFileName}",
-                                        fontWeight = FontWeight.Bold,
-                                        color = TextPrimary,
-                                        fontSize = 13.sp,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                    Text(
-                                        text = "${formatBytes(state.overallBytes)} of ${formatBytes(state.overallTotalBytes)} • ${String.format("%.1f", state.speedMbPerSec)} MB/s",
-                                        color = RubyRedLight,
-                                        fontSize = 11.sp,
-                                        fontWeight = FontWeight.SemiBold
-                                    )
-                                }
-                                is TransferState.Completed -> {
-                                    Text(
-                                        text = "Transfer Complete",
-                                        fontWeight = FontWeight.Bold,
-                                        color = AccentEmerald,
-                                        fontSize = 13.sp
-                                    )
-                                    Text(
-                                        text = "Tap to view transferred files",
-                                        color = TextSecondary,
-                                        fontSize = 11.sp
-                                    )
-                                }
-                                else -> {
-                                    Text(
-                                        text = "Connected to Peer",
-                                        fontWeight = FontWeight.Bold,
-                                        color = TextPrimary,
-                                        fontSize = 13.sp
-                                    )
-                                    Text(
-                                        text = "Tap to open Transfer status & records",
-                                        color = TextSecondary,
-                                        fontSize = 11.sp
-                                    )
-                                }
+                        Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
+                            if (activeTransferState is TransferState.Transferring) {
+                                CircularProgressIndicator(
+                                    progress = { liveProgress },
+                                    color = Color.White,
+                                    trackColor = Color.White.copy(alpha = 0.3f),
+                                    strokeWidth = 3.dp,
+                                    modifier = Modifier.fillMaxSize()
+                                )
+                                Text(
+                                    text = "${(liveProgress * 100).toInt()}%",
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.ExtraBold,
+                                    color = Color.White
+                                )
+                            } else {
+                                Icon(
+                                    imageVector = Icons.Default.SwapVert,
+                                    contentDescription = "Transferring",
+                                    tint = Color.White,
+                                    modifier = Modifier.size(26.dp)
+                                )
                             }
                         }
-
-                        Icon(
-                            imageVector = Icons.Default.KeyboardArrowUp,
-                            contentDescription = "Expand",
-                            tint = TextSecondary,
-                            modifier = Modifier.size(24.dp)
-                        )
                     }
                 }
             }
@@ -1682,7 +1778,7 @@ fun StorageExplorerView(
                                 Text(
                                     text = "Phone Storage",
                                     fontWeight = FontWeight.Bold,
-                                    color = Color.White,
+                                    color = TextPrimary,
                                     fontSize = 15.sp
                                 )
                                 Spacer(modifier = Modifier.height(2.dp))
@@ -1746,7 +1842,7 @@ fun StorageExplorerView(
                                     Text(
                                         text = sdDrive.name,
                                         fontWeight = FontWeight.Bold,
-                                        color = Color.White,
+                                        color = TextPrimary,
                                         fontSize = 15.sp
                                     )
                                     Spacer(modifier = Modifier.height(2.dp))
@@ -1941,7 +2037,7 @@ fun StorageExplorerView(
                             text = "${selectedCategory.title} (${filteredCategoryFiles.size})",
                             fontSize = 14.sp,
                             fontWeight = FontWeight.Bold,
-                            color = Color.White,
+                            color = TextPrimary,
                             modifier = Modifier.weight(1f),
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
@@ -2062,7 +2158,7 @@ fun StorageExplorerView(
                                         Text(
                                             text = fileInfo.name,
                                             fontWeight = FontWeight.SemiBold,
-                                            color = Color.White,
+                                            color = TextPrimary,
                                             fontSize = 13.sp,
                                             maxLines = 1,
                                             overflow = TextOverflow.Ellipsis
@@ -2165,7 +2261,7 @@ fun StorageExplorerView(
                             text = currentDirectory?.name?.ifEmpty { "Root" } ?: "Phone Storage",
                             fontSize = 13.sp,
                             fontWeight = FontWeight.Bold,
-                            color = Color.White,
+                            color = TextPrimary,
                             modifier = Modifier.weight(1f),
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
@@ -2246,7 +2342,7 @@ fun StorageExplorerView(
                                         text = drive.name,
                                         fontSize = 11.sp,
                                         fontWeight = FontWeight.Bold,
-                                        color = Color.White,
+                                        color = TextPrimary,
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis
                                     )
@@ -2326,7 +2422,7 @@ fun StorageExplorerView(
                                         Text(
                                             text = item.name,
                                             fontWeight = FontWeight.SemiBold,
-                                            color = Color.White,
+                                            color = TextPrimary,
                                             fontSize = 13.sp,
                                             maxLines = 1,
                                             overflow = TextOverflow.Ellipsis
@@ -2412,7 +2508,7 @@ fun CategoryFolderRow(
                 Text(
                     text = title,
                     fontWeight = FontWeight.Bold,
-                    color = Color.White,
+                    color = TextPrimary,
                     fontSize = 15.sp
                 )
                 if (extraTitleTag != null) {
@@ -2452,9 +2548,11 @@ fun CategoryFolderRow(
 fun CategoryTabBar(
     selectedTab: CategoryTab,
     onSelectTab: (CategoryTab) -> Unit,
+    listState: androidx.compose.foundation.lazy.LazyListState = androidx.compose.foundation.lazy.rememberLazyListState(),
     modifier: Modifier = Modifier
 ) {
     LazyRow(
+        state = listState,
         modifier = modifier
             .fillMaxWidth()
             .background(XenderGreen)
@@ -2531,7 +2629,8 @@ fun AppsGrid(
                         Box(
                             modifier = Modifier
                                 .size(54.dp)
-                                .background(SurfaceCard, RoundedCornerShape(12.dp)),
+                                .background(SurfaceCard, RoundedCornerShape(12.dp))
+                                .border(1.dp, BorderSubtle, RoundedCornerShape(12.dp)),
                             contentAlignment = Alignment.Center
                         ) {
                             Icon(Icons.Default.Android, contentDescription = null, tint = RubyRedLight)
@@ -2553,7 +2652,7 @@ fun AppsGrid(
                 Text(
                     text = app.name,
                     fontSize = 12.sp,
-                    color = Color.White,
+                    color = TextPrimary,
                     fontWeight = FontWeight.Medium,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
@@ -2614,7 +2713,7 @@ fun PhotosDayWiseGrid(
                             text = dayGroup.dateLabel,
                             fontSize = 15.sp,
                             fontWeight = FontWeight.Bold,
-                            color = Color.White
+                            color = TextPrimary
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
@@ -2866,7 +2965,7 @@ fun ContactsList(
                         Text(
                             text = contact.name,
                             fontWeight = FontWeight.SemiBold,
-                            color = Color.White,
+                            color = TextPrimary,
                             fontSize = 14.sp
                         )
                         Text(
@@ -2913,7 +3012,7 @@ fun PermissionRequestBanner(
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 Icon(Icons.Default.Lock, contentDescription = null, tint = RubyRedLight, modifier = Modifier.size(46.dp))
-                Text(title, fontWeight = FontWeight.Bold, fontSize = 16.sp, color = Color.White, textAlign = TextAlign.Center)
+                Text(title, fontWeight = FontWeight.Bold, fontSize = 16.sp, color = TextPrimary, textAlign = TextAlign.Center)
                 Text(description, fontSize = 13.sp, color = TextSecondary, textAlign = TextAlign.Center)
                 Spacer(modifier = Modifier.height(4.dp))
                 Button(
@@ -2972,7 +3071,7 @@ fun FastShareDockedBottomBar(
                     Text(
                         text = if (isSharingActive) "⚡ +$count new" else "⚡ $count items",
                         fontWeight = FontWeight.ExtraBold,
-                        color = Color.White,
+                        color = TextPrimary,
                         fontSize = 15.sp
                     )
                     Spacer(modifier = Modifier.width(6.dp))

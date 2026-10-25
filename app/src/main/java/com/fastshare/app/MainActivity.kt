@@ -97,6 +97,9 @@ fun MainAppNavHost(
 
     fun stopSharingSession() {
         try {
+            fileServer?.notifyDisconnect()
+        } catch (e: Exception) {}
+        try {
             fileServer?.stop()
         } catch (e: Exception) {
             e.printStackTrace()

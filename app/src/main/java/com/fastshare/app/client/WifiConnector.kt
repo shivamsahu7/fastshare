@@ -19,6 +19,7 @@ class WifiConnector(private val context: Context) {
     private val wifiManager: WifiManager =
         context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
 
+    var onNetworkLost: (() -> Unit)? = null
     private var activeCallback: ConnectivityManager.NetworkCallback? = null
 
     interface ConnectionCallback {
@@ -66,6 +67,7 @@ class WifiConnector(private val context: Context) {
                     override fun onLost(network: Network) {
                         super.onLost(network)
                         connectivityManager.bindProcessToNetwork(null)
+                        onNetworkLost?.invoke()
                     }
                 }
 
