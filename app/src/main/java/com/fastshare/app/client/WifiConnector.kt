@@ -27,6 +27,9 @@ class WifiConnector(private val context: Context) {
         fun onFailure(reason: String)
     }
 
+    var activeNetwork: Network? = null
+        private set
+
     @SuppressLint("MissingPermission")
     fun connectToHotspot(ssid: String, password: String, callback: ConnectionCallback) {
         disconnect()
@@ -54,6 +57,7 @@ class WifiConnector(private val context: Context) {
                 val networkCallback = object : ConnectivityManager.NetworkCallback() {
                     override fun onAvailable(network: Network) {
                         super.onAvailable(network)
+                        activeNetwork = network
                         // Bind process so all subsequent HTTP requests route through the Hotspot
                         connectivityManager.bindProcessToNetwork(network)
                         callback.onConnected(network)
@@ -61,11 +65,13 @@ class WifiConnector(private val context: Context) {
 
                     override fun onUnavailable() {
                         super.onUnavailable()
+                        activeNetwork = null
                         callback.onFailure("Failed to connect: User declined or network unavailable")
                     }
 
                     override fun onLost(network: Network) {
                         super.onLost(network)
+                        activeNetwork = null
                         connectivityManager.bindProcessToNetwork(null)
                         onNetworkLost?.invoke()
                     }
@@ -109,6 +115,7 @@ class WifiConnector(private val context: Context) {
 
     fun disconnect() {
         try {
+            activeNetwork = null
             activeCallback?.let {
                 connectivityManager.unregisterNetworkCallback(it)
                 activeCallback = null

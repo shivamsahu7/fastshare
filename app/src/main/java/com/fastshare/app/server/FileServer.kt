@@ -220,6 +220,7 @@ class FileServer(
 
             uri == "/connect" || uri == "/ping" -> {
                 isPeerConnected = true
+                isPeerConnectedState.value = true
                 val remoteIp = session.remoteIpAddress ?: "Peer Device"
                 val deviceName = session.headers["x-device-name"] ?: session.parameters["device"]?.firstOrNull() ?: remoteIp
                 onPeerConnected?.invoke(deviceName)

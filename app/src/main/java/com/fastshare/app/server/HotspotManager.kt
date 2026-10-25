@@ -77,13 +77,17 @@ class HotspotManager(private val context: Context) {
                     ssid = ssid.removeSurrounding("\"")
                     password = password.removeSurrounding("\"")
 
-                    var localIp = getLocalIpAddress()
-                    if (!localIp.startsWith("192.168.4") && !localIp.startsWith("192.168.5")) {
-                        try { Thread.sleep(200) } catch (ignored: Exception) {}
-                        localIp = getLocalIpAddress()
-                    }
-                    if (!localIp.startsWith("192.168.4") && !localIp.startsWith("192.168.5")) {
-                        localIp = "192.168.43.1"
+                    var localIp = "192.168.43.1"
+                    for (i in 0 until 10) {
+                        val detected = getLocalIpAddress()
+                        if (detected.isNotEmpty() && detected != "192.168.43.1" && !detected.startsWith("127.") && !detected.startsWith("169.254.")) {
+                            localIp = detected
+                            break
+                        }
+                        if (detected == "192.168.43.1") {
+                            localIp = detected
+                        }
+                        try { Thread.sleep(100) } catch (ignored: Exception) {}
                     }
                     callback.onHotspotStarted(ssid, password, localIp)
                 }

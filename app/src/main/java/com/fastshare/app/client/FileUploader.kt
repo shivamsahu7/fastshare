@@ -1,8 +1,10 @@
 package com.fastshare.app.client
 
 import android.content.Context
+import android.net.Network
 import android.net.Uri
 import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.PowerManager
 import com.fastshare.app.data.SharedFileItem
 import com.fastshare.app.service.TransferService
@@ -17,16 +19,28 @@ import java.util.concurrent.TimeUnit
 
 class FileUploader(private val context: Context) {
 
-    private class HighSpeedSocketFactory : javax.net.SocketFactory() {
-        private val delegate = javax.net.SocketFactory.getDefault()
-        override fun createSocket(): java.net.Socket = configure(delegate.createSocket())
-        override fun createSocket(host: String?, port: Int): java.net.Socket = configure(delegate.createSocket(host, port))
-        override fun createSocket(host: String?, port: Int, localHost: java.net.InetAddress?, localPort: Int): java.net.Socket = configure(delegate.createSocket(host, port, localHost, localPort))
-        override fun createSocket(host: java.net.InetAddress?, port: Int): java.net.Socket = configure(delegate.createSocket(host, port))
-        override fun createSocket(address: java.net.InetAddress?, port: Int, localAddress: java.net.InetAddress?, localPort: Int): java.net.Socket = configure(delegate.createSocket(address, port, localAddress, localPort))
+    var activeNetwork: Network? = null
+
+    private inner class HighSpeedSocketFactory : javax.net.SocketFactory() {
+        private fun getDelegate(): javax.net.SocketFactory {
+            return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && activeNetwork != null) {
+                activeNetwork!!.socketFactory
+            } else {
+                javax.net.SocketFactory.getDefault()
+            }
+        }
+
+        override fun createSocket(): java.net.Socket = configure(getDelegate().createSocket())
+        override fun createSocket(host: String?, port: Int): java.net.Socket = configure(getDelegate().createSocket(host, port))
+        override fun createSocket(host: String?, port: Int, localHost: java.net.InetAddress?, localPort: Int): java.net.Socket = configure(getDelegate().createSocket(host, port, localHost, localPort))
+        override fun createSocket(host: java.net.InetAddress?, port: Int): java.net.Socket = configure(getDelegate().createSocket(host, port))
+        override fun createSocket(address: java.net.InetAddress?, port: Int, localAddress: java.net.InetAddress?, localPort: Int): java.net.Socket = configure(getDelegate().createSocket(address, port, localAddress, localPort))
 
         private fun configure(socket: java.net.Socket): java.net.Socket {
             try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    activeNetwork?.bindSocket(socket)
+                }
                 socket.tcpNoDelay = true
                 socket.sendBufferSize = 1024 * 1024 // 1 MB high-speed TCP window
                 socket.receiveBufferSize = 1024 * 1024

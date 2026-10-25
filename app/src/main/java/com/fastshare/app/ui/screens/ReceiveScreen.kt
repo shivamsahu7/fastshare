@@ -166,6 +166,8 @@ fun ReceiveScreen(
         isHandshakeConfirmed = false
         connectedServerUrl = ""
         fileDownloader.clearSession()
+        fileDownloader.activeNetwork = null
+        fileUploader.activeNetwork = null
         try { wifiConnector.disconnect() } catch (ignored: Exception) {}
         TransferService.stop(context)
         transferState = TransferState.Idle
@@ -188,7 +190,11 @@ fun ReceiveScreen(
                 delay(5000)
                 try {
                     val pingUrl = java.net.URL("$connectedServerUrl/ping")
-                    val conn = pingUrl.openConnection() as java.net.HttpURLConnection
+                    val conn = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && wifiConnector.activeNetwork != null) {
+                        wifiConnector.activeNetwork!!.openConnection(pingUrl) as java.net.HttpURLConnection
+                    } else {
+                        pingUrl.openConnection() as java.net.HttpURLConnection
+                    }
                     conn.connectTimeout = 2500
                     conn.readTimeout = 2500
                     conn.requestMethod = "GET"
@@ -365,54 +371,13 @@ fun ReceiveScreen(
             password = password,
             callback = object : WifiConnector.ConnectionCallback {
                 override fun onConnected(network: Network?) {
+                    fileDownloader.activeNetwork = network
+                    fileUploader.activeNetwork = network
                     transferState = TransferState.Starting("Establishing connection with sender...")
+
                     coroutineScope.launch(Dispatchers.IO) {
                         val deviceModel = "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}".trim()
 
-                        // 1. Resolve Gateway IP from newly connected Wi-Fi interface
-                        var gatewayIp: String? = null
-                        try {
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && network != null) {
-                                val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
-                                val linkProps = cm?.getLinkProperties(network)
-                                if (linkProps != null) {
-                                    for (route in linkProps.routes) {
-                                        val gw = route.gateway
-                                        if (gw is java.net.Inet4Address && !gw.isLoopbackAddress) {
-                                            val host = gw.hostAddress
-                                            if (!host.isNullOrEmpty() && host != "0.0.0.0") {
-                                                gatewayIp = host
-                                                break
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        } catch (e: Exception) {
-                            e.printStackTrace()
-                        }
-
-                        if (gatewayIp.isNullOrEmpty()) {
-                            try {
-                                val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? android.net.wifi.WifiManager
-                                val dhcp = wm?.dhcpInfo
-                                if (dhcp != null && dhcp.gateway != 0) {
-                                    val gwInt = dhcp.gateway
-                                    gatewayIp = String.format(
-                                        java.util.Locale.US,
-                                        "%d.%d.%d.%d",
-                                        gwInt and 0xff,
-                                        (gwInt shr 8) and 0xff,
-                                        (gwInt shr 16) and 0xff,
-                                        (gwInt shr 24) and 0xff
-                                    )
-                                }
-                            } catch (e: Exception) {
-                                e.printStackTrace()
-                            }
-                        }
-
-                        // Determine port from QR URL (defaults to 8080)
                         val uriPort = try {
                             val parsed = android.net.Uri.parse(serverUrl)
                             if (parsed.port > 0) parsed.port else 8080
@@ -420,30 +385,73 @@ fun ReceiveScreen(
                             8080
                         }
 
-                        // Build candidate URLs (Gateway IP takes highest priority)
-                        val candidateUrls = mutableListOf<String>()
-                        if (!gatewayIp.isNullOrEmpty()) {
-                            candidateUrls.add("http://$gatewayIp:$uriPort")
-                        }
-                        if (serverUrl.isNotEmpty() && !candidateUrls.contains(serverUrl)) {
-                            candidateUrls.add(serverUrl)
-                        }
-                        if (!candidateUrls.contains("http://192.168.43.1:$uriPort")) {
-                            candidateUrls.add("http://192.168.43.1:$uriPort")
-                        }
-                        if (!candidateUrls.contains("http://192.168.49.1:$uriPort")) {
-                            candidateUrls.add("http://192.168.49.1:$uriPort")
-                        }
-
-                        // Active handshake with Sender FileServer
                         var resolvedUrl: String? = null
-                        for (attempt in 1..8) {
+
+                        for (attempt in 1..15) {
+                            var gatewayIp: String? = null
+                            try {
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && network != null) {
+                                    val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
+                                    val linkProps = cm?.getLinkProperties(network)
+                                    if (linkProps != null) {
+                                        for (route in linkProps.routes) {
+                                            val gw = route.gateway
+                                            if (gw is java.net.Inet4Address && !gw.isLoopbackAddress && !gw.isAnyLocalAddress) {
+                                                val host = gw.hostAddress
+                                                if (!host.isNullOrEmpty() && host != "0.0.0.0") {
+                                                    gatewayIp = host
+                                                    break
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } catch (e: Exception) {
+                                e.printStackTrace()
+                            }
+
+                            if (gatewayIp.isNullOrEmpty()) {
+                                try {
+                                    val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? android.net.wifi.WifiManager
+                                    val dhcp = wm?.dhcpInfo
+                                    if (dhcp != null && dhcp.gateway != 0) {
+                                        val gwInt = dhcp.gateway
+                                        gatewayIp = String.format(
+                                            java.util.Locale.US,
+                                            "%d.%d.%d.%d",
+                                            gwInt and 0xff,
+                                            (gwInt shr 8) and 0xff,
+                                            (gwInt shr 16) and 0xff,
+                                            (gwInt shr 24) and 0xff
+                                        )
+                                    }
+                                } catch (e: Exception) {
+                                    e.printStackTrace()
+                                }
+                            }
+
+                            val candidateUrls = LinkedHashSet<String>()
+                            if (!gatewayIp.isNullOrEmpty()) {
+                                candidateUrls.add("http://$gatewayIp:$uriPort")
+                            }
+                            if (serverUrl.isNotEmpty()) {
+                                candidateUrls.add(serverUrl)
+                            }
+                            candidateUrls.add("http://192.168.43.1:$uriPort")
+                            candidateUrls.add("http://192.168.49.1:$uriPort")
+                            candidateUrls.add("http://192.168.44.1:$uriPort")
+                            candidateUrls.add("http://192.168.50.1:$uriPort")
+
                             for (url in candidateUrls) {
                                 try {
                                     val connUrl = java.net.URL("$url/connect")
-                                    val conn = connUrl.openConnection() as java.net.HttpURLConnection
-                                    conn.connectTimeout = 1500
-                                    conn.readTimeout = 1500
+                                    val conn = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && network != null) {
+                                        network.openConnection(connUrl) as java.net.HttpURLConnection
+                                    } else {
+                                        connUrl.openConnection() as java.net.HttpURLConnection
+                                    }
+                                    conn.connectTimeout = 1200
+                                    conn.readTimeout = 1200
                                     conn.requestMethod = "GET"
                                     conn.setRequestProperty("x-device-name", deviceModel)
                                     val code = conn.responseCode
@@ -454,14 +462,21 @@ fun ReceiveScreen(
                                 } catch (ignored: Exception) {}
                             }
                             if (resolvedUrl != null) break
-                            kotlinx.coroutines.delay(350)
+                            kotlinx.coroutines.delay(400)
                         }
 
-                        val finalUrl = resolvedUrl ?: candidateUrls.firstOrNull() ?: serverUrl
-                        withContext(Dispatchers.Main) {
-                            isHandshakeConfirmed = true
-                            connectedServerUrl = finalUrl
-                            startDownload(finalUrl)
+                        if (resolvedUrl != null) {
+                            withContext(Dispatchers.Main) {
+                                isHandshakeConfirmed = true
+                                connectedServerUrl = resolvedUrl
+                                startDownload(resolvedUrl)
+                            }
+                        } else {
+                            withContext(Dispatchers.Main) {
+                                isHandshakeConfirmed = false
+                                transferState = TransferState.Error("Could not reach sender device. Please check Wi-Fi connection.")
+                                Toast.makeText(context, "Could not connect to sender device", Toast.LENGTH_LONG).show()
+                            }
                         }
                     }
                 }

@@ -71,7 +71,10 @@ import com.fastshare.app.service.TransferService
 import com.fastshare.app.ui.components.DisconnectConfirmationDialog
 import com.fastshare.app.ui.components.TransferringSheet
 import com.fastshare.app.ui.theme.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
 import java.util.UUID
@@ -281,7 +284,11 @@ fun SendScreen(
                 coroutineScope.launch(kotlinx.coroutines.Dispatchers.IO) {
                     try {
                         val discUrl = java.net.URL("$connectedHostUrl/disconnect")
-                        val conn = discUrl.openConnection() as java.net.HttpURLConnection
+                        val conn = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && wifiConnector.activeNetwork != null) {
+                            wifiConnector.activeNetwork!!.openConnection(discUrl) as java.net.HttpURLConnection
+                        } else {
+                            discUrl.openConnection() as java.net.HttpURLConnection
+                        }
                         conn.connectTimeout = 1500
                         conn.readTimeout = 1500
                         conn.requestMethod = "GET"
@@ -291,6 +298,8 @@ fun SendScreen(
             }
             wifiConnector.disconnect()
         }
+        fileDownloader.activeNetwork = null
+        fileUploader.activeNetwork = null
         isHostConnected = false
         isClientConnected = false
         peerDeviceName = ""
@@ -740,30 +749,120 @@ fun SendScreen(
                 password = password,
                 callback = object : WifiConnector.ConnectionCallback {
                     override fun onConnected(network: Network?) {
-                        isClientConnected = true
+                        fileDownloader.activeNetwork = network
+                        fileUploader.activeNetwork = network
+                        clientTransferState = TransferState.Starting("Connecting to sender...")
 
-                        coroutineScope.launch {
-                            try {
-                                val connUrl = java.net.URL("$serverUrl/connect")
-                                val conn = connUrl.openConnection() as java.net.HttpURLConnection
-                                conn.connectTimeout = 3000
-                                conn.readTimeout = 3000
-                                conn.requestMethod = "GET"
-                                conn.setRequestProperty("x-device-name", android.os.Build.MODEL)
-                                if (conn.responseCode == 200) {
-                                    val resp = conn.inputStream.bufferedReader().readText()
-                                    val json = JSONObject(resp)
-                                    val remoteModel = json.optString("deviceName", "Peer Device")
+                        coroutineScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                            val uriPort = try {
+                                val parsed = android.net.Uri.parse(serverUrl)
+                                if (parsed.port > 0) parsed.port else 8080
+                            } catch (e: Exception) {
+                                8080
+                            }
+
+                            val deviceModel = "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}".trim()
+                            var resolvedUrl: String? = null
+                            var remoteModel = "Peer Device"
+                            var filesCount = 0
+
+                            for (attempt in 1..15) {
+                                var dynamicGateway: String? = null
+                                try {
+                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && network != null) {
+                                        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
+                                        val linkProps = cm?.getLinkProperties(network)
+                                        if (linkProps != null) {
+                                            for (route in linkProps.routes) {
+                                                val gw = route.gateway
+                                                if (gw is java.net.Inet4Address && !gw.isLoopbackAddress && !gw.isAnyLocalAddress) {
+                                                    val host = gw.hostAddress
+                                                    if (!host.isNullOrEmpty() && host != "0.0.0.0") {
+                                                        dynamicGateway = host
+                                                        break
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                } catch (e: Exception) {
+                                    e.printStackTrace()
+                                }
+
+                                if (dynamicGateway.isNullOrEmpty()) {
+                                    try {
+                                        val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? android.net.wifi.WifiManager
+                                        val dhcp = wm?.dhcpInfo
+                                        if (dhcp != null && dhcp.gateway != 0) {
+                                            val gwInt = dhcp.gateway
+                                            dynamicGateway = String.format(
+                                                java.util.Locale.US,
+                                                "%d.%d.%d.%d",
+                                                gwInt and 0xff,
+                                                (gwInt shr 8) and 0xff,
+                                                (gwInt shr 16) and 0xff,
+                                                (gwInt shr 24) and 0xff
+                                            )
+                                        }
+                                    } catch (e: Exception) {
+                                        e.printStackTrace()
+                                    }
+                                }
+
+                                val candidateUrls = LinkedHashSet<String>()
+                                if (!dynamicGateway.isNullOrEmpty()) {
+                                    candidateUrls.add("http://$dynamicGateway:$uriPort")
+                                }
+                                if (serverUrl.isNotEmpty()) {
+                                    candidateUrls.add(serverUrl)
+                                }
+                                candidateUrls.add("http://192.168.43.1:$uriPort")
+                                candidateUrls.add("http://192.168.49.1:$uriPort")
+                                candidateUrls.add("http://192.168.44.1:$uriPort")
+                                candidateUrls.add("http://192.168.50.1:$uriPort")
+
+                                for (candidate in candidateUrls) {
+                                    try {
+                                        val connUrl = java.net.URL("$candidate/connect")
+                                        val conn = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && network != null) {
+                                            network.openConnection(connUrl) as java.net.HttpURLConnection
+                                        } else {
+                                            connUrl.openConnection() as java.net.HttpURLConnection
+                                        }
+                                        conn.connectTimeout = 1200
+                                        conn.readTimeout = 1200
+                                        conn.requestMethod = "GET"
+                                        conn.setRequestProperty("x-device-name", deviceModel)
+                                        if (conn.responseCode == 200) {
+                                            val resp = conn.inputStream.bufferedReader().readText()
+                                            val respJson = JSONObject(resp)
+                                            remoteModel = respJson.optString("deviceName", "Peer Device")
+                                            filesCount = respJson.optInt("filesCount", 0)
+                                            resolvedUrl = candidate
+                                            break
+                                        }
+                                    } catch (ignored: Exception) {}
+                                }
+                                if (resolvedUrl != null) break
+                                kotlinx.coroutines.delay(400)
+                            }
+
+                            if (resolvedUrl != null) {
+                                withContext(kotlinx.coroutines.Dispatchers.Main) {
+                                    isClientConnected = true
+                                    connectedHostUrl = resolvedUrl
                                     peerDeviceName = remoteModel
-                                    val count = json.optInt("filesCount", 0)
-                                    if (count > 0) {
-                                        startClientDownload(serverUrl)
+                                    if (filesCount > 0) {
+                                        startClientDownload(resolvedUrl)
                                     } else {
                                         clientTransferState = TransferState.Idle
                                     }
                                 }
-                            } catch (e: Exception) {
-                                e.printStackTrace()
+                            } else {
+                                withContext(kotlinx.coroutines.Dispatchers.Main) {
+                                    clientTransferState = TransferState.Error("Could not reach sender device")
+                                    Toast.makeText(context, "Connection failed: Could not reach sender device", Toast.LENGTH_LONG).show()
+                                }
                             }
                         }
                     }

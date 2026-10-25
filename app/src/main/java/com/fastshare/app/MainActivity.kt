@@ -106,6 +106,7 @@ fun MainAppNavHost(
         }
         fileServer = null
         hotspotManager.stopHotspot()
+        fileDownloader.activeNetwork = null
         transferState = TransferState.Idle
         qrBitmap = null
         com.fastshare.app.service.TransferService.stop(context)
