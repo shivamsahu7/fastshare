@@ -324,6 +324,13 @@ fun SendScreen(
         }
     }
 
+    LaunchedEffect(isConnected) {
+        if (isConnected) {
+            showQrModal = false
+            showQrScanner = false
+        }
+    }
+
     // Flow Functions
     fun startSenderSharing() {
         val itemsList = selectedItems.values.toList()
@@ -430,9 +437,12 @@ fun SendScreen(
                 activeFileServer = server
 
                 server.onPeerConnected = { remoteName ->
-                    isHostConnected = true
-                    peerDeviceName = remoteName
-                    showQrModal = false
+                    coroutineScope.launch(kotlinx.coroutines.Dispatchers.Main) {
+                        isHostConnected = true
+                        peerDeviceName = remoteName
+                        showQrModal = false
+                        showQrScanner = false
+                    }
                 }
                 server.onPeerDisconnected = {
                     coroutineScope.launch(kotlinx.coroutines.Dispatchers.Main) {
@@ -1541,7 +1551,7 @@ fun SendScreen(
         // -------------------------------------------------------------------------------------
         // Full-screen Camera QR Scanner Dialog
         // -------------------------------------------------------------------------------------
-        if (showQrScanner) {
+        if (showQrScanner && !isConnected) {
             Dialog(
                 onDismissRequest = { showQrScanner = false },
                 properties = DialogProperties(usePlatformDefaultWidth = false)
@@ -1589,7 +1599,7 @@ fun SendScreen(
         // -------------------------------------------------------------------------------------
         // Full-screen QR Code Modal (Sender Hotspot QR Code)
         // -------------------------------------------------------------------------------------
-        if (showQrModal && currentQrBitmap != null) {
+        if (showQrModal && !isConnected && currentQrBitmap != null) {
             Dialog(
                 onDismissRequest = { showQrModal = false },
                 properties = DialogProperties(usePlatformDefaultWidth = false)

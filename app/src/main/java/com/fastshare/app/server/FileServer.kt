@@ -113,6 +113,13 @@ class FileServer(
             return resp
         }
 
+        if (uri != "/disconnect" && !isDisconnecting && !isPeerConnected) {
+            isPeerConnected = true
+            val remoteIp = session.remoteIpAddress ?: "Peer Device"
+            val deviceName = session.headers["x-device-name"] ?: session.parameters["device"]?.firstOrNull() ?: remoteIp
+            onPeerConnected?.invoke(deviceName)
+        }
+
         return when {
             (uri == "/upload" || uri.startsWith("/upload")) && session.method == Method.POST -> {
                 try {

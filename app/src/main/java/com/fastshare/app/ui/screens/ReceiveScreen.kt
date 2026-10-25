@@ -285,6 +285,8 @@ fun ReceiveScreen(
                                         totalBytes = totalBytes,
                                         destinationPath = targetDirectory
                                     )
+                                } else if (transferState is TransferState.Starting) {
+                                    transferState = TransferState.Idle
                                 }
                             }
 
@@ -336,6 +338,17 @@ fun ReceiveScreen(
             password = password,
             callback = object : WifiConnector.ConnectionCallback {
                 override fun onConnected(network: Network?) {
+                    coroutineScope.launch(Dispatchers.IO) {
+                        try {
+                            val connUrl = java.net.URL("$serverUrl/connect")
+                            val conn = connUrl.openConnection() as java.net.HttpURLConnection
+                            conn.connectTimeout = 2500
+                            conn.readTimeout = 2500
+                            conn.requestMethod = "GET"
+                            conn.setRequestProperty("x-device-name", "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}".trim())
+                            conn.responseCode
+                        } catch (ignored: Exception) {}
+                    }
                     startDownload(serverUrl)
                 }
 
@@ -485,6 +498,8 @@ fun ReceiveScreen(
                            transferState is TransferState.Starting ||
                            uploadState is TransferState.Starting)
 
+    val isConnectedToHost = isSessionActive || (connectedServerUrl.isNotEmpty() && isDownloadLoopActive)
+
     var showReceiverDisconnectDialog by remember { mutableStateOf(false) }
 
     androidx.activity.compose.BackHandler(enabled = isSessionActive) {
@@ -575,7 +590,6 @@ fun ReceiveScreen(
             }
 
             // Disconnect Button with Cross Icon (prominent red badge)
-            val isConnectedToHost = isSessionActive || (connectedServerUrl.isNotEmpty() && isDownloadLoopActive)
             if (isConnectedToHost) {
                 Surface(
                     onClick = { showReceiverDisconnectDialog = true },
@@ -804,40 +818,42 @@ fun ReceiveScreen(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
-                // Mode Selector: [ Scan QR ] [ Manual Wi-Fi ]
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(16.dp))
-                        .background(SurfaceCard)
-                        .padding(4.dp)
-                ) {
-                    Button(
-                        onClick = { receiveMode = ReceiveMode.SCAN_QR },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (receiveMode == ReceiveMode.SCAN_QR) RubyRed else Color.Transparent,
-                            contentColor = if (receiveMode == ReceiveMode.SCAN_QR) Color.White else TextSecondary
-                        ),
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier.weight(1f)
+                // Mode Selector: [ Scan QR ] [ Manual Wi-Fi ] (Shown only when not connected)
+                if (!isConnectedToHost && connectedServerUrl.isEmpty()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(16.dp))
+                            .background(SurfaceCard)
+                            .padding(4.dp)
                     ) {
-                        Icon(Icons.Default.QrCodeScanner, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Scan QR", fontWeight = FontWeight.Bold)
-                    }
+                        Button(
+                            onClick = { receiveMode = ReceiveMode.SCAN_QR },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (receiveMode == ReceiveMode.SCAN_QR) RubyRed else Color.Transparent,
+                                contentColor = if (receiveMode == ReceiveMode.SCAN_QR) Color.White else TextSecondary
+                            ),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(Icons.Default.QrCodeScanner, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Scan QR", fontWeight = FontWeight.Bold)
+                        }
 
-                    Button(
-                        onClick = { receiveMode = ReceiveMode.MANUAL_INPUT },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (receiveMode == ReceiveMode.MANUAL_INPUT) RubyRed else Color.Transparent,
-                            contentColor = if (receiveMode == ReceiveMode.MANUAL_INPUT) Color.White else TextSecondary
-                        ),
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Icon(Icons.Default.Wifi, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Manual Wi-Fi", fontWeight = FontWeight.Bold)
+                        Button(
+                            onClick = { receiveMode = ReceiveMode.MANUAL_INPUT },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (receiveMode == ReceiveMode.MANUAL_INPUT) RubyRed else Color.Transparent,
+                                contentColor = if (receiveMode == ReceiveMode.MANUAL_INPUT) Color.White else TextSecondary
+                            ),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(Icons.Default.Wifi, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Manual Wi-Fi", fontWeight = FontWeight.Bold)
+                        }
                     }
                 }
 
@@ -987,8 +1003,45 @@ fun ReceiveScreen(
                     }
                 }
 
+                if (isConnectedToHost && (transferState is TransferState.Idle || (transferState is TransferState.Starting && isDownloadLoopActive))) {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(containerColor = SurfaceCard),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, BorderSubtle),
+                        shape = RoundedCornerShape(20.dp)
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(24.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(56.dp)
+                                    .clip(CircleShape)
+                                    .background(AccentEmerald.copy(alpha = 0.15f)),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(Icons.Default.CheckCircle, contentDescription = null, tint = AccentEmerald, modifier = Modifier.size(34.dp))
+                            }
+                            Spacer(modifier = Modifier.height(14.dp))
+                            Text(
+                                text = "Connected to Sender",
+                                fontWeight = FontWeight.Bold,
+                                color = TextPrimary,
+                                fontSize = 17.sp
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "Ready to receive files automatically",
+                                color = TextSecondary,
+                                fontSize = 13.sp
+                            )
+                        }
+                    }
+                }
+
                 // Mode 1: Camera QR Scanner View
-                if (receiveMode == ReceiveMode.SCAN_QR && transferState is TransferState.Idle) {
+                if (receiveMode == ReceiveMode.SCAN_QR && transferState is TransferState.Idle && !isConnectedToHost && connectedServerUrl.isEmpty()) {
                     Card(
                         modifier = Modifier.fillMaxWidth(),
                         colors = CardDefaults.cardColors(containerColor = SurfaceCard),
