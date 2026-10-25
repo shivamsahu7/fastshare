@@ -45,6 +45,8 @@ class FileServer(
     var isPeerConnected: Boolean = false
         private set
 
+    val isPeerConnectedState = androidx.compose.runtime.mutableStateOf(false)
+
     @Volatile
     var isDisconnecting: Boolean = false
         private set
@@ -56,6 +58,7 @@ class FileServer(
         if (isDisconnecting) return
         isDisconnecting = true
         isPeerConnected = false
+        isPeerConnectedState.value = false
         onPeerDisconnected?.invoke()
     }
 
@@ -116,12 +119,9 @@ class FileServer(
         if (uri != "/disconnect" && !isDisconnecting) {
             val remoteIp = session.remoteIpAddress ?: "Peer Device"
             val deviceName = session.headers["x-device-name"] ?: session.parameters["device"]?.firstOrNull() ?: remoteIp
-            if (!isPeerConnected) {
-                isPeerConnected = true
-                onPeerConnected?.invoke(deviceName)
-            } else if (uri == "/connect" || uri == "/manifest") {
-                onPeerConnected?.invoke(deviceName)
-            }
+            isPeerConnected = true
+            isPeerConnectedState.value = true
+            onPeerConnected?.invoke(deviceName)
         }
 
         return when {
@@ -237,6 +237,7 @@ class FileServer(
 
             uri == "/disconnect" -> {
                 isPeerConnected = false
+                isPeerConnectedState.value = false
                 onPeerDisconnected?.invoke()
                 val respObj = JSONObject().apply {
                     put("status", "disconnected")

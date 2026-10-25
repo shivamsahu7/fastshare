@@ -168,7 +168,9 @@ fun SendScreen(
     var peerDeviceName by remember { mutableStateOf("") }
     val sessionTransferRecords = remember { mutableStateListOf<TransferRecord>() }
 
-    val isConnected = isHostConnected || isClientConnected || ((activeFileServer ?: fileServer)?.isPeerConnected == true)
+    val currentServer = activeFileServer ?: fileServer
+    val isPeerConnectedReactive = (currentServer?.isPeerConnectedState?.value == true) || (currentServer?.isPeerConnected == true)
+    val isConnected = isHostConnected || isClientConnected || isPeerConnectedReactive
     val activeTransferState = if (isClientConnected) clientTransferState else transferState
 
     // Permission check for Photos & Videos (including Android 14 visual user selected)
@@ -387,6 +389,14 @@ fun SendScreen(
                 showQrModal = false
                 showQrScanner = false
             }
+        }
+    }
+
+    LaunchedEffect(isPeerConnectedReactive) {
+        if (isPeerConnectedReactive) {
+            isHostConnected = true
+            showQrModal = false
+            showQrScanner = false
         }
     }
 
@@ -1324,7 +1334,11 @@ fun SendScreen(
                                     fileServer.addItems(selectedItems.values.toList())
                                     selectedItems.clear()
                                 }
-                                showQrModal = true
+                                if (!isConnected) {
+                                    showQrModal = true
+                                } else {
+                                    Toast.makeText(context, "Added to transfer queue", Toast.LENGTH_SHORT).show()
+                                }
                             } else {
                                 startSenderSharing()
                             }
@@ -1665,7 +1679,7 @@ fun SendScreen(
         // -------------------------------------------------------------------------------------
         // Full-screen QR Code Modal (Sender Hotspot QR Code)
         // -------------------------------------------------------------------------------------
-        val isSenderConnected = isHostConnected || isClientConnected || ((activeFileServer ?: fileServer)?.isPeerConnected == true)
+        val isSenderConnected = isConnected || isHostConnected || isClientConnected || ((activeFileServer ?: fileServer)?.isPeerConnectedState?.value == true) || ((activeFileServer ?: fileServer)?.isPeerConnected == true)
         if (showQrModal && !isSenderConnected && currentQrBitmap != null) {
             Dialog(
                 onDismissRequest = { showQrModal = false },

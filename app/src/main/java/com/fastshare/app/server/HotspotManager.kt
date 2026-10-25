@@ -77,7 +77,14 @@ class HotspotManager(private val context: Context) {
                     ssid = ssid.removeSurrounding("\"")
                     password = password.removeSurrounding("\"")
 
-                    val localIp = getLocalIpAddress()
+                    var localIp = getLocalIpAddress()
+                    if (!localIp.startsWith("192.168.4") && !localIp.startsWith("192.168.5")) {
+                        try { Thread.sleep(200) } catch (ignored: Exception) {}
+                        localIp = getLocalIpAddress()
+                    }
+                    if (!localIp.startsWith("192.168.4") && !localIp.startsWith("192.168.5")) {
+                        localIp = "192.168.43.1"
+                    }
                     callback.onHotspotStarted(ssid, password, localIp)
                 }
 
@@ -133,30 +140,42 @@ class HotspotManager(private val context: Context) {
 
     fun getLocalIpAddress(): String {
         try {
-            val interfaces = NetworkInterface.getNetworkInterfaces()
-            while (interfaces.hasMoreElements()) {
-                val intf = interfaces.nextElement()
+            val allInterfaces = java.util.Collections.list(NetworkInterface.getNetworkInterfaces())
+
+            // Priority 1: SoftAP interface names (ap0, softap0, swlan0, wlan1) with valid IPv4
+            for (intf in allInterfaces) {
                 val name = intf.name.lowercase()
-                // Typical AP / wlan / tethering interfaces on Android: ap0, wlan0, swlan0, rndis0
-                if (name.contains("ap") || name.contains("wlan") || name.contains("softap")) {
-                    val addrs = intf.inetAddresses
-                    while (addrs.hasMoreElements()) {
-                        val addr = addrs.nextElement()
+                if (name.startsWith("ap") || name.startsWith("softap") || name.startsWith("swlan") || name == "wlan1") {
+                    val addrs = java.util.Collections.list(intf.inetAddresses)
+                    for (addr in addrs) {
                         if (!addr.isLoopbackAddress && addr is Inet4Address) {
                             val host = addr.hostAddress ?: ""
-                            if (host.isNotEmpty()) return host
+                            if (host.isNotEmpty() && !host.startsWith("127.") && !host.startsWith("169.254.")) {
+                                return host
+                            }
                         }
                     }
                 }
             }
 
-            // Fallback: check any non-loopback IPv4
-            val allInterfaces = NetworkInterface.getNetworkInterfaces()
-            while (allInterfaces.hasMoreElements()) {
-                val intf = allInterfaces.nextElement()
-                val addrs = intf.inetAddresses
-                while (addrs.hasMoreElements()) {
-                    val addr = addrs.nextElement()
+            // Priority 2: Standard Android LocalOnlyHotspot subnets (192.168.43.x, 192.168.44.x ... 192.168.50.x)
+            for (intf in allInterfaces) {
+                val addrs = java.util.Collections.list(intf.inetAddresses)
+                for (addr in addrs) {
+                    if (!addr.isLoopbackAddress && addr is Inet4Address) {
+                        val host = addr.hostAddress ?: ""
+                        if (host.startsWith("192.168.4") || host.startsWith("192.168.5")) {
+                            return host
+                        }
+                    }
+                }
+            }
+
+            // Priority 3: Non-wlan0 active IPv4 interfaces
+            for (intf in allInterfaces) {
+                if (intf.name.lowercase() == "wlan0") continue
+                val addrs = java.util.Collections.list(intf.inetAddresses)
+                for (addr in addrs) {
                     if (!addr.isLoopbackAddress && addr is Inet4Address) {
                         val host = addr.hostAddress ?: ""
                         if (host.isNotEmpty() && !host.startsWith("127.") && !host.startsWith("169.254.")) {

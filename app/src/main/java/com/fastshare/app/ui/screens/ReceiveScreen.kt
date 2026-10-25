@@ -158,10 +158,12 @@ fun ReceiveScreen(
     }
 
     var isDownloadLoopActive by remember { mutableStateOf(false) }
+    var isHandshakeConfirmed by remember { mutableStateOf(false) }
 
     fun handlePeerDisconnected() {
         if (!isDownloadLoopActive && connectedServerUrl.isEmpty() && transferState is TransferState.Idle) return
         isDownloadLoopActive = false
+        isHandshakeConfirmed = false
         connectedServerUrl = ""
         fileDownloader.clearSession()
         try { wifiConnector.disconnect() } catch (ignored: Exception) {}
@@ -355,6 +357,7 @@ fun ReceiveScreen(
     }
 
     fun connectAndReceive(ssid: String, password: String, serverUrl: String) {
+        isHandshakeConfirmed = false
         connectedServerUrl = serverUrl
         transferState = TransferState.Starting("Connecting to sender's Wi-Fi...")
         wifiConnector.connectToHotspot(
@@ -362,26 +365,105 @@ fun ReceiveScreen(
             password = password,
             callback = object : WifiConnector.ConnectionCallback {
                 override fun onConnected(network: Network?) {
+                    transferState = TransferState.Starting("Establishing connection with sender...")
                     coroutineScope.launch(Dispatchers.IO) {
                         val deviceModel = "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}".trim()
-                        for (attempt in 1..5) {
+
+                        // 1. Resolve Gateway IP from newly connected Wi-Fi interface
+                        var gatewayIp: String? = null
+                        try {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && network != null) {
+                                val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
+                                val linkProps = cm?.getLinkProperties(network)
+                                if (linkProps != null) {
+                                    for (route in linkProps.routes) {
+                                        val gw = route.gateway
+                                        if (gw is java.net.Inet4Address && !gw.isLoopbackAddress) {
+                                            val host = gw.hostAddress
+                                            if (!host.isNullOrEmpty() && host != "0.0.0.0") {
+                                                gatewayIp = host
+                                                break
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                        }
+
+                        if (gatewayIp.isNullOrEmpty()) {
                             try {
-                                val connUrl = java.net.URL("$serverUrl/connect")
-                                val conn = connUrl.openConnection() as java.net.HttpURLConnection
-                                conn.connectTimeout = 3000
-                                conn.readTimeout = 3000
-                                conn.requestMethod = "GET"
-                                conn.setRequestProperty("x-device-name", deviceModel)
-                                val code = conn.responseCode
-                                if (code == 200 || code == 410) {
-                                    break
+                                val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? android.net.wifi.WifiManager
+                                val dhcp = wm?.dhcpInfo
+                                if (dhcp != null && dhcp.gateway != 0) {
+                                    val gwInt = dhcp.gateway
+                                    gatewayIp = String.format(
+                                        java.util.Locale.US,
+                                        "%d.%d.%d.%d",
+                                        gwInt and 0xff,
+                                        (gwInt shr 8) and 0xff,
+                                        (gwInt shr 16) and 0xff,
+                                        (gwInt shr 24) and 0xff
+                                    )
                                 }
                             } catch (e: Exception) {
-                                kotlinx.coroutines.delay(500)
+                                e.printStackTrace()
                             }
                         }
+
+                        // Determine port from QR URL (defaults to 8080)
+                        val uriPort = try {
+                            val parsed = android.net.Uri.parse(serverUrl)
+                            if (parsed.port > 0) parsed.port else 8080
+                        } catch (e: Exception) {
+                            8080
+                        }
+
+                        // Build candidate URLs (Gateway IP takes highest priority)
+                        val candidateUrls = mutableListOf<String>()
+                        if (!gatewayIp.isNullOrEmpty()) {
+                            candidateUrls.add("http://$gatewayIp:$uriPort")
+                        }
+                        if (serverUrl.isNotEmpty() && !candidateUrls.contains(serverUrl)) {
+                            candidateUrls.add(serverUrl)
+                        }
+                        if (!candidateUrls.contains("http://192.168.43.1:$uriPort")) {
+                            candidateUrls.add("http://192.168.43.1:$uriPort")
+                        }
+                        if (!candidateUrls.contains("http://192.168.49.1:$uriPort")) {
+                            candidateUrls.add("http://192.168.49.1:$uriPort")
+                        }
+
+                        // Active handshake with Sender FileServer
+                        var resolvedUrl: String? = null
+                        for (attempt in 1..8) {
+                            for (url in candidateUrls) {
+                                try {
+                                    val connUrl = java.net.URL("$url/connect")
+                                    val conn = connUrl.openConnection() as java.net.HttpURLConnection
+                                    conn.connectTimeout = 1500
+                                    conn.readTimeout = 1500
+                                    conn.requestMethod = "GET"
+                                    conn.setRequestProperty("x-device-name", deviceModel)
+                                    val code = conn.responseCode
+                                    if (code == 200 || code == 410) {
+                                        resolvedUrl = url
+                                        break
+                                    }
+                                } catch (ignored: Exception) {}
+                            }
+                            if (resolvedUrl != null) break
+                            kotlinx.coroutines.delay(350)
+                        }
+
+                        val finalUrl = resolvedUrl ?: candidateUrls.firstOrNull() ?: serverUrl
+                        withContext(Dispatchers.Main) {
+                            isHandshakeConfirmed = true
+                            connectedServerUrl = finalUrl
+                            startDownload(finalUrl)
+                        }
                     }
-                    startDownload(serverUrl)
                 }
 
                 override fun onFailure(reason: String) {
@@ -530,7 +612,10 @@ fun ReceiveScreen(
                            transferState is TransferState.Starting ||
                            uploadState is TransferState.Starting)
 
-    val isConnectedToHost = isSessionActive || (connectedServerUrl.isNotEmpty() && isDownloadLoopActive)
+    val isConnectedToHost = isHandshakeConfirmed ||
+            transferState is TransferState.Transferring ||
+            uploadState is TransferState.Transferring ||
+            (connectedServerUrl.isNotEmpty() && isHandshakeConfirmed)
 
     var showReceiverDisconnectDialog by remember { mutableStateOf(false) }
 
