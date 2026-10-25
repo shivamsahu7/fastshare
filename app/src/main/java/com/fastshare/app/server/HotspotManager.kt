@@ -159,7 +159,7 @@ class HotspotManager(private val context: Context) {
                     val addr = addrs.nextElement()
                     if (!addr.isLoopbackAddress && addr is Inet4Address) {
                         val host = addr.hostAddress ?: ""
-                        if (host.isNotEmpty() && !host.startsWith("10.") && !host.startsWith("172.")) {
+                        if (host.isNotEmpty() && !host.startsWith("127.") && !host.startsWith("169.254.")) {
                             return host
                         }
                     }

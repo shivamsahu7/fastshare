@@ -17,7 +17,27 @@ import java.util.concurrent.TimeUnit
 
 class FileUploader(private val context: Context) {
 
+    private class HighSpeedSocketFactory : javax.net.SocketFactory() {
+        private val delegate = javax.net.SocketFactory.getDefault()
+        override fun createSocket(): java.net.Socket = configure(delegate.createSocket())
+        override fun createSocket(host: String?, port: Int): java.net.Socket = configure(delegate.createSocket(host, port))
+        override fun createSocket(host: String?, port: Int, localHost: java.net.InetAddress?, localPort: Int): java.net.Socket = configure(delegate.createSocket(host, port, localHost, localPort))
+        override fun createSocket(host: java.net.InetAddress?, port: Int): java.net.Socket = configure(delegate.createSocket(host, port))
+        override fun createSocket(address: java.net.InetAddress?, port: Int, localAddress: java.net.InetAddress?, localPort: Int): java.net.Socket = configure(delegate.createSocket(address, port, localAddress, localPort))
+
+        private fun configure(socket: java.net.Socket): java.net.Socket {
+            try {
+                socket.tcpNoDelay = true
+                socket.sendBufferSize = 1024 * 1024 // 1 MB high-speed TCP window
+                socket.receiveBufferSize = 1024 * 1024
+                socket.trafficClass = 0x10 // IPTOS_LOWDELAY
+            } catch (ignored: Exception) {}
+            return socket
+        }
+    }
+
     private val client = OkHttpClient.Builder()
+        .socketFactory(HighSpeedSocketFactory())
         .connectTimeout(30, TimeUnit.SECONDS)
         .writeTimeout(0, TimeUnit.SECONDS) // No timeout for large uploads
         .readTimeout(120, TimeUnit.SECONDS)
@@ -71,13 +91,23 @@ class FileUploader(private val context: Context) {
         }
 
         val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
-        @Suppress("DEPRECATION")
-        val wifiLock = wifiManager?.createWifiLock(
-            WifiManager.WIFI_MODE_FULL_HIGH_PERF,
-            "FastShare:FileUploaderWifiLock"
-        )?.apply {
-            setReferenceCounted(false)
-            acquire()
+        val wifiLock = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+            wifiManager?.createWifiLock(
+                WifiManager.WIFI_MODE_FULL_LOW_LATENCY,
+                "FastShare:FileUploaderWifiLock"
+            )?.apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            wifiManager?.createWifiLock(
+                WifiManager.WIFI_MODE_FULL_HIGH_PERF,
+                "FastShare:FileUploaderWifiLock"
+            )?.apply {
+                setReferenceCounted(false)
+                acquire()
+            }
         }
 
         val totalFiles = items.size

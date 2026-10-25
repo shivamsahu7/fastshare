@@ -245,7 +245,7 @@ fun MainAppNavHost(
                     ReceiveScreen(
                         wifiConnector = wifiConnector,
                         fileDownloader = fileDownloader,
-                        onBack = { currentScreen = AppScreen.HOME }
+                        onBack = { currentScreen = AppScreen.SEND }
                     )
                 }
             }

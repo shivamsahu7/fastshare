@@ -311,11 +311,11 @@ fun SendScreen(
     LaunchedEffect(isHostConnected, activeFileServer) {
         if (isHostConnected) {
             while (isHostConnected) {
-                kotlinx.coroutines.delay(2000)
+                kotlinx.coroutines.delay(3000)
                 val s = activeFileServer ?: fileServer
                 if (s != null && s.isPeerConnected) {
                     val silenceDuration = System.currentTimeMillis() - s.lastPeerActivityTime
-                    if (silenceDuration > 8000L) {
+                    if (silenceDuration > 60000L) {
                         disconnectDevice(notifyPeer = false, toastMessage = "Peer device disconnected")
                         break
                     }

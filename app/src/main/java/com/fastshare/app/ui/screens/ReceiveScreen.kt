@@ -40,6 +40,7 @@ import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import com.fastshare.app.client.FileDownloader
 import com.fastshare.app.client.FileUploader
 import com.fastshare.app.client.WifiConnector
@@ -179,6 +180,29 @@ fun ReceiveScreen(
         }
     }
 
+    LaunchedEffect(connectedServerUrl) {
+        if (connectedServerUrl.isNotEmpty()) {
+            while (connectedServerUrl.isNotEmpty()) {
+                delay(5000)
+                try {
+                    val pingUrl = java.net.URL("$connectedServerUrl/ping")
+                    val conn = pingUrl.openConnection() as java.net.HttpURLConnection
+                    conn.connectTimeout = 2500
+                    conn.readTimeout = 2500
+                    conn.requestMethod = "GET"
+                    conn.setRequestProperty("x-device-name", "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}".trim())
+                    val code = conn.responseCode
+                    if (code == 410) {
+                        withContext(Dispatchers.Main) {
+                            handlePeerDisconnected()
+                        }
+                        break
+                    }
+                } catch (ignored: Exception) {}
+            }
+        }
+    }
+
     fun startDownload(serverUrl: String) {
         connectedServerUrl = serverUrl
         if (isDownloadLoopActive) return
@@ -308,7 +332,7 @@ fun ReceiveScreen(
                                         errorMessage = message
                                     )
                                 }
-                                if (consecutiveErrors >= 2) {
+                                if (consecutiveErrors >= 5) {
                                     coroutineScope.launch(Dispatchers.Main) {
                                         handlePeerDisconnected()
                                     }
@@ -318,13 +342,13 @@ fun ReceiveScreen(
                     )
                 } catch (e: Exception) {
                     consecutiveErrors++
-                    if (consecutiveErrors >= 2) {
+                    if (consecutiveErrors >= 5) {
                         coroutineScope.launch(Dispatchers.Main) {
                             handlePeerDisconnected()
                         }
                     }
                 }
-                delay(1200)
+                delay(1500)
             }
             isDownloadLoopActive = false
         }

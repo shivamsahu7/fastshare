@@ -151,8 +151,20 @@ class FileServer(
                     if (tempFilePath != null) {
                         val tempFile = File(tempFilePath)
                         if (tempFile.exists()) {
-                            tempFile.copyTo(destFile, overwrite = true)
-                            bytesWritten = destFile.length()
+                            try {
+                                tempFile.copyTo(destFile, overwrite = true)
+                                bytesWritten = destFile.length()
+                            } catch (e: Exception) {
+                                try {
+                                    val fallbackDir = File(context.getExternalFilesDir(null), "Received").apply { mkdirs() }
+                                    val fallbackFile = File(fallbackDir, destFile.name)
+                                    tempFile.copyTo(fallbackFile, overwrite = true)
+                                    destFile = fallbackFile
+                                    bytesWritten = destFile.length()
+                                } catch (e2: Exception) {
+                                    e2.printStackTrace()
+                                }
+                            }
                             try { tempFile.delete() } catch (ignored: Exception) {}
                         }
                     }

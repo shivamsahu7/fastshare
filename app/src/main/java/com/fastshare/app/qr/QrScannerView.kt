@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.size
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -43,6 +44,20 @@ fun QrScannerView(
     val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
     val hasScanned = remember { AtomicBoolean(false) }
 
+    DisposableEffect(Unit) {
+        onDispose {
+            try {
+                cameraExecutor.shutdown()
+            } catch (ignored: Exception) {}
+            try {
+                val providerFuture = ProcessCameraProvider.getInstance(context)
+                if (providerFuture.isDone) {
+                    providerFuture.get().unbindAll()
+                }
+            } catch (ignored: Exception) {}
+        }
+    }
+
     Box(modifier = modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         AndroidView(
             modifier = Modifier.fillMaxSize(),
@@ -62,6 +77,7 @@ fun QrScannerView(
                     }
 
                     val barcodeScanner = BarcodeScanning.getClient()
+                    @Suppress("DEPRECATION")
                     val imageAnalysis = ImageAnalysis.Builder()
                         .setTargetResolution(Size(1280, 720))
                         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)

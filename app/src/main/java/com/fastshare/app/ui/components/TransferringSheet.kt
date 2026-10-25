@@ -90,15 +90,16 @@ fun TransferringSheet(
                     isCompleted -> TransferItemStatus.COMPLETED
                     else -> TransferItemStatus.QUEUED
                 }
-                val bytesTransferred = if (isActive && transferState is TransferState.Transferring) {
-                    transferState.currentFileBytes
+                val activeState = if (isActive) transferState as TransferState.Transferring else null
+                val bytesTransferred = if (activeState != null) {
+                    activeState.currentFileBytes
                 } else if (isCompleted) {
                     item.size
                 } else {
                     0L
                 }
-                val progress = if (isActive && transferState is TransferState.Transferring) {
-                    transferState.progress
+                val progress = if (activeState != null) {
+                    activeState.progress
                 } else if (isCompleted) {
                     1f
                 } else {
@@ -114,7 +115,7 @@ fun TransferringSheet(
                         status = status,
                         bytesTransferred = bytesTransferred,
                         progress = progress,
-                        speedMbPerSec = if (isActive && transferState is TransferState.Transferring) transferState.speedMbPerSec else 0.0
+                        speedMbPerSec = activeState?.speedMbPerSec ?: 0.0
                     )
                 )
             }
@@ -323,7 +324,7 @@ fun TransferringSheet(
                     contentPadding = PaddingValues(14.dp),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    items(unifiedList, key = { it.id }) { record ->
+                    items(unifiedList, key = { "${it.id}_${it.name}_${it.direction}" }) { record ->
                         TransferRecordRow(
                             record = record,
                             onRetry = { onRetryTransfer?.invoke(record) }

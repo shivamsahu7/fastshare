@@ -626,10 +626,46 @@ class MediaRepository(private val context: Context) {
     }
 
     suspend fun getCategorizedCounts(): Map<CategorizedFileType, Int> = withContext(Dispatchers.IO) {
-        val counts = mutableMapOf<CategorizedFileType, Int>()
-        CategorizedFileType.values().forEach { cat ->
-            counts[cat] = loadCategorizedFiles(cat).size
+        val counts = mutableMapOf(
+            CategorizedFileType.DOCUMENTS to 0,
+            CategorizedFileType.EBOOKS to 0,
+            CategorizedFileType.APKS to 0,
+            CategorizedFileType.ARCHIVES to 0,
+            CategorizedFileType.BIG_FILES to 0
+        )
+        val docExtensions = setOf("pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "wps", "csv", "rtf")
+        val ebookExtensions = setOf("txt", "epub", "mobi", "chm", "ebk", "umd")
+        val apkExtensions = setOf("apk")
+        val archiveExtensions = setOf("zip", "rar", "7z", "tar", "gz", "iso")
+        val minBigFileSize = 50 * 1024 * 1024L
+
+        val projection = arrayOf(
+            MediaStore.Files.FileColumns.DISPLAY_NAME,
+            MediaStore.Files.FileColumns.SIZE
+        )
+
+        try {
+            val uri = MediaStore.Files.getContentUri("external")
+            context.contentResolver.query(uri, projection, null, null, null)?.use { cursor ->
+                val nameCol = cursor.getColumnIndex(MediaStore.Files.FileColumns.DISPLAY_NAME)
+                val sizeCol = cursor.getColumnIndex(MediaStore.Files.FileColumns.SIZE)
+
+                while (cursor.moveToNext()) {
+                    val name = if (nameCol >= 0) cursor.getString(nameCol) ?: "" else ""
+                    val size = if (sizeCol >= 0) cursor.getLong(sizeCol) else 0L
+                    val ext = name.substringAfterLast('.', "").lowercase()
+
+                    if (ext in docExtensions) counts[CategorizedFileType.DOCUMENTS] = counts[CategorizedFileType.DOCUMENTS]!! + 1
+                    if (ext in ebookExtensions) counts[CategorizedFileType.EBOOKS] = counts[CategorizedFileType.EBOOKS]!! + 1
+                    if (ext in apkExtensions) counts[CategorizedFileType.APKS] = counts[CategorizedFileType.APKS]!! + 1
+                    if (ext in archiveExtensions) counts[CategorizedFileType.ARCHIVES] = counts[CategorizedFileType.ARCHIVES]!! + 1
+                    if (size >= minBigFileSize) counts[CategorizedFileType.BIG_FILES] = counts[CategorizedFileType.BIG_FILES]!! + 1
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
+
         counts
     }
 
