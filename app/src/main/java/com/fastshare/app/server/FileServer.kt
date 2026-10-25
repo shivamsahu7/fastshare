@@ -113,11 +113,15 @@ class FileServer(
             return resp
         }
 
-        if (uri != "/disconnect" && !isDisconnecting && !isPeerConnected) {
-            isPeerConnected = true
+        if (uri != "/disconnect" && !isDisconnecting) {
             val remoteIp = session.remoteIpAddress ?: "Peer Device"
             val deviceName = session.headers["x-device-name"] ?: session.parameters["device"]?.firstOrNull() ?: remoteIp
-            onPeerConnected?.invoke(deviceName)
+            if (!isPeerConnected) {
+                isPeerConnected = true
+                onPeerConnected?.invoke(deviceName)
+            } else if (uri == "/connect" || uri == "/manifest") {
+                onPeerConnected?.invoke(deviceName)
+            }
         }
 
         return when {

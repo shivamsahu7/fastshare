@@ -117,14 +117,14 @@ class FileDownloader(private val context: Context) {
 
             val manifestResponse = try {
                 client.newBuilder()
-                    .connectTimeout(2500, TimeUnit.MILLISECONDS)
-                    .readTimeout(3000, TimeUnit.MILLISECONDS)
-                    .retryOnConnectionFailure(false)
+                    .connectTimeout(8000, TimeUnit.MILLISECONDS)
+                    .readTimeout(8000, TimeUnit.MILLISECONDS)
+                    .retryOnConnectionFailure(true)
                     .build()
                     .newCall(manifestRequest)
                     .execute()
             } catch (e: Exception) {
-                callback.onError("PEER_DISCONNECTED")
+                callback.onError("Connection error: ${e.message ?: "server unreachable"}")
                 return@withContext
             }
 

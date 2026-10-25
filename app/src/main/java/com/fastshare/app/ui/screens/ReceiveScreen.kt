@@ -363,15 +363,23 @@ fun ReceiveScreen(
             callback = object : WifiConnector.ConnectionCallback {
                 override fun onConnected(network: Network?) {
                     coroutineScope.launch(Dispatchers.IO) {
-                        try {
-                            val connUrl = java.net.URL("$serverUrl/connect")
-                            val conn = connUrl.openConnection() as java.net.HttpURLConnection
-                            conn.connectTimeout = 2500
-                            conn.readTimeout = 2500
-                            conn.requestMethod = "GET"
-                            conn.setRequestProperty("x-device-name", "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}".trim())
-                            conn.responseCode
-                        } catch (ignored: Exception) {}
+                        val deviceModel = "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}".trim()
+                        for (attempt in 1..5) {
+                            try {
+                                val connUrl = java.net.URL("$serverUrl/connect")
+                                val conn = connUrl.openConnection() as java.net.HttpURLConnection
+                                conn.connectTimeout = 3000
+                                conn.readTimeout = 3000
+                                conn.requestMethod = "GET"
+                                conn.setRequestProperty("x-device-name", deviceModel)
+                                val code = conn.responseCode
+                                if (code == 200 || code == 410) {
+                                    break
+                                }
+                            } catch (e: Exception) {
+                                kotlinx.coroutines.delay(500)
+                            }
+                        }
                     }
                     startDownload(serverUrl)
                 }

@@ -324,8 +324,74 @@ fun SendScreen(
         }
     }
 
-    LaunchedEffect(isConnected) {
-        if (isConnected) {
+    LaunchedEffect(transferState) {
+        if (transferState is TransferState.HotspotActive) {
+            if (currentHotspotSsid.isEmpty()) currentHotspotSsid = transferState.ssid
+            if (currentHotspotPassword.isEmpty()) currentHotspotPassword = transferState.password
+            if (currentQrBitmap == null) {
+                val qrJson = org.json.JSONObject().apply {
+                    put("ssid", transferState.ssid)
+                    put("password", transferState.password)
+                    put("serverUrl", transferState.serverUrl)
+                    put("type", "fastshare_hotspot")
+                }.toString()
+                currentQrBitmap = com.fastshare.app.qr.QrCodeGenerator.generate(qrJson, 600)
+            }
+        }
+    }
+
+    LaunchedEffect(showQrModal, activeFileServer, fileServer) {
+        if (showQrModal) {
+            val server = activeFileServer ?: fileServer
+            server?.onPeerConnected = { remoteName ->
+                coroutineScope.launch(kotlinx.coroutines.Dispatchers.Main) {
+                    isHostConnected = true
+                    if (remoteName.isNotBlank()) {
+                        peerDeviceName = remoteName
+                    }
+                    showQrModal = false
+                    showQrScanner = false
+                }
+            }
+            while (showQrModal) {
+                kotlinx.coroutines.delay(200)
+                val curServer = activeFileServer ?: fileServer
+                if (curServer != null && curServer.isPeerConnected) {
+                    isHostConnected = true
+                    if (peerDeviceName.isBlank()) {
+                        peerDeviceName = "Connected Device"
+                    }
+                    showQrModal = false
+                    showQrScanner = false
+                    break
+                }
+            }
+        }
+    }
+
+    LaunchedEffect(activeFileServer, fileServer) {
+        val server = activeFileServer ?: fileServer
+        if (server != null) {
+            server.onPeerConnected = { remoteName ->
+                coroutineScope.launch(kotlinx.coroutines.Dispatchers.Main) {
+                    isHostConnected = true
+                    if (remoteName.isNotBlank()) {
+                        peerDeviceName = remoteName
+                    }
+                    showQrModal = false
+                    showQrScanner = false
+                }
+            }
+            if (server.isPeerConnected) {
+                isHostConnected = true
+                showQrModal = false
+                showQrScanner = false
+            }
+        }
+    }
+
+    LaunchedEffect(isHostConnected, isClientConnected, isConnected) {
+        if (isHostConnected || isClientConnected || isConnected) {
             showQrModal = false
             showQrScanner = false
         }
@@ -1599,7 +1665,8 @@ fun SendScreen(
         // -------------------------------------------------------------------------------------
         // Full-screen QR Code Modal (Sender Hotspot QR Code)
         // -------------------------------------------------------------------------------------
-        if (showQrModal && !isConnected && currentQrBitmap != null) {
+        val isSenderConnected = isHostConnected || isClientConnected || ((activeFileServer ?: fileServer)?.isPeerConnected == true)
+        if (showQrModal && !isSenderConnected && currentQrBitmap != null) {
             Dialog(
                 onDismissRequest = { showQrModal = false },
                 properties = DialogProperties(usePlatformDefaultWidth = false)
@@ -1612,72 +1679,285 @@ fun SendScreen(
                         modifier = Modifier
                             .fillMaxSize()
                             .statusBarsPadding()
-                            .padding(20.dp),
+                            .navigationBarsPadding()
+                            .verticalScroll(rememberScrollState())
+                            .padding(horizontal = 20.dp, vertical = 12.dp),
                         horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.SpaceBetween
+                        verticalArrangement = Arrangement.spacedBy(16.dp)
                     ) {
+                        // Top Bar
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            IconButton(onClick = { showQrModal = false }) {
-                                Icon(Icons.Default.Close, contentDescription = "Close", tint = TextPrimary)
+                            IconButton(
+                                onClick = { showQrModal = false },
+                                modifier = Modifier
+                                    .size(40.dp)
+                                    .clip(CircleShape)
+                                    .background(SurfaceElevated)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Close,
+                                    contentDescription = "Close",
+                                    tint = TextPrimary
+                                )
                             }
-                            Text("Ready to Connect", fontWeight = FontWeight.Bold, fontSize = 18.sp, color = TextPrimary)
-                            Spacer(Modifier.size(40.dp))
+
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text(
+                                    text = "Scan to Connect",
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 18.sp,
+                                    color = TextPrimary
+                                )
+                                Text(
+                                    text = "Receiver connects via QR scanner",
+                                    fontSize = 12.sp,
+                                    color = TextSecondary
+                                )
+                            }
+
+                            // Theme Toggle Button
+                            IconButton(
+                                onClick = { ThemeState.toggle() },
+                                modifier = Modifier
+                                    .size(40.dp)
+                                    .clip(CircleShape)
+                                    .background(SurfaceElevated)
+                            ) {
+                                Icon(
+                                    imageVector = if (ThemeState.isDarkMode) Icons.Default.WbSunny else Icons.Default.Brightness4,
+                                    contentDescription = "Toggle Theme",
+                                    tint = if (ThemeState.isDarkMode) AccentAmber else AccentPurple,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
                         }
 
-                        Card(
+                        // QR Code Card
+                        Surface(
                             shape = RoundedCornerShape(24.dp),
-                            colors = CardDefaults.cardColors(containerColor = Color.White),
-                            elevation = CardDefaults.cardElevation(defaultElevation = 8.dp),
-                            modifier = Modifier.padding(16.dp)
+                            color = SurfaceCard,
+                            border = androidx.compose.foundation.BorderStroke(1.5.dp, BorderSubtle),
+                            shadowElevation = 8.dp,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 8.dp)
                         ) {
                             Column(
-                                modifier = Modifier.padding(20.dp),
+                                modifier = Modifier.padding(18.dp),
                                 horizontalAlignment = Alignment.CenterHorizontally
                             ) {
-                                Image(
-                                    bitmap = currentQrBitmap!!.asImageBitmap(),
-                                    contentDescription = "QR Code",
-                                    modifier = Modifier.size(260.dp)
+                                Box(
+                                    modifier = Modifier
+                                        .size(220.dp)
+                                        .clip(RoundedCornerShape(16.dp))
+                                        .background(Color.White)
+                                        .padding(10.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Image(
+                                        bitmap = currentQrBitmap!!.asImageBitmap(),
+                                        contentDescription = "FastShare QR Code",
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                }
+
+                                Spacer(Modifier.height(14.dp))
+
+                                Row(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(10.dp))
+                                        .background(SurfaceElevated)
+                                        .padding(horizontal = 12.dp, vertical = 6.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.QrCodeScanner,
+                                        contentDescription = null,
+                                        tint = XenderGreenLight,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(Modifier.width(6.dp))
+                                    Text(
+                                        text = "Point receiver camera at this code",
+                                        fontWeight = FontWeight.SemiBold,
+                                        fontSize = 12.sp,
+                                        color = TextPrimary
+                                    )
+                                }
+                            }
+                        }
+
+                        // Pulsing Waiting Indicator
+                        val infiniteTransition = rememberInfiniteTransition(label = "pulseTransition")
+                        val pulseAlpha by infiniteTransition.animateFloat(
+                            initialValue = 0.35f,
+                            targetValue = 1f,
+                            animationSpec = infiniteRepeatable(
+                                animation = tween(900, easing = FastOutSlowInEasing),
+                                repeatMode = RepeatMode.Reverse
+                            ),
+                            label = "pulseAlpha"
+                        )
+
+                        Surface(
+                            shape = RoundedCornerShape(14.dp),
+                            color = XenderGreenLight.copy(alpha = 0.12f),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, XenderGreenLight.copy(alpha = 0.35f)),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.Center
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(10.dp)
+                                        .clip(CircleShape)
+                                        .background(XenderGreenLight.copy(alpha = pulseAlpha))
                                 )
-                                Spacer(Modifier.height(12.dp))
+                                Spacer(Modifier.width(10.dp))
                                 Text(
-                                    text = "Scan with FastShare on Receiver",
-                                    fontWeight = FontWeight.SemiBold,
-                                    fontSize = 14.sp,
-                                    color = Color.Black
+                                    text = "Waiting for receiver to scan & connect...",
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    color = TextPrimary
                                 )
                             }
                         }
 
+                        // Hotspot Credentials Card
+                        Surface(
+                            shape = RoundedCornerShape(18.dp),
+                            color = SurfaceCard,
+                            border = androidx.compose.foundation.BorderStroke(1.dp, BorderSubtle),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(14.dp),
+                                verticalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(34.dp)
+                                            .clip(CircleShape)
+                                            .background(SurfaceElevated),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Wifi,
+                                            contentDescription = null,
+                                            tint = XenderGreenLight,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+                                    Spacer(Modifier.width(10.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = "Wi-Fi Hotspot SSID",
+                                            fontSize = 11.sp,
+                                            color = TextSecondary
+                                        )
+                                        Text(
+                                            text = currentHotspotSsid.ifEmpty { "FastShare Hotspot" },
+                                            fontWeight = FontWeight.Bold,
+                                            fontSize = 14.sp,
+                                            color = TextPrimary,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                }
+
+                                HorizontalDivider(
+                                    color = BorderSubtle.copy(alpha = 0.5f),
+                                    thickness = 1.dp
+                                )
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(34.dp)
+                                            .clip(CircleShape)
+                                            .background(SurfaceElevated),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Lock,
+                                            contentDescription = null,
+                                            tint = AccentAmber,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+                                    Spacer(Modifier.width(10.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = "Network Password",
+                                            fontSize = 11.sp,
+                                            color = TextSecondary
+                                        )
+                                        Text(
+                                            text = if (currentHotspotPassword.isNotEmpty()) currentHotspotPassword else "Open / Direct Wi-Fi (No password required)",
+                                            fontWeight = if (currentHotspotPassword.isNotEmpty()) FontWeight.Bold else FontWeight.Normal,
+                                            fontSize = 13.sp,
+                                            color = if (currentHotspotPassword.isNotEmpty()) TextPrimary else TextSecondary,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        // Bottom Actions: Minimize & Select More Files
                         Column(
                             modifier = Modifier.fillMaxWidth(),
-                            horizontalAlignment = Alignment.CenterHorizontally
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            Text(
-                                text = "Hotspot SSID: $currentHotspotSsid",
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 14.sp,
-                                color = TextPrimary
-                            )
-                            Spacer(Modifier.height(4.dp))
-                            Text(
-                                text = "Password: $currentHotspotPassword",
-                                fontSize = 12.sp,
-                                color = TextSecondary
-                            )
-                            Spacer(Modifier.height(16.dp))
                             Button(
                                 onClick = { showQrModal = false },
                                 colors = ButtonDefaults.buttonColors(containerColor = XenderGreenLight),
-                                shape = RoundedCornerShape(20.dp),
-                                modifier = Modifier.fillMaxWidth().height(48.dp)
+                                shape = RoundedCornerShape(16.dp),
+                                elevation = ButtonDefaults.buttonElevation(defaultElevation = 6.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(52.dp)
                             ) {
-                                Text("Minimize & Browse Files", fontWeight = FontWeight.Bold, color = Color.White)
+                                Icon(
+                                    imageVector = Icons.Default.Layers,
+                                    contentDescription = null,
+                                    tint = Color.White,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Text(
+                                    text = "Minimize & Browse Files",
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 15.sp,
+                                    color = Color.White
+                                )
                             }
+
+                            Text(
+                                text = "Hotspot stays active in background until disconnected",
+                                fontSize = 11.sp,
+                                color = TextSecondary,
+                                textAlign = TextAlign.Center
+                            )
+
+                            Spacer(Modifier.height(8.dp))
                         }
                     }
                 }
