@@ -28,6 +28,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.google.mlkit.vision.barcode.BarcodeScannerOptions
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
@@ -43,11 +44,19 @@ fun QrScannerView(
     val lifecycleOwner = LocalLifecycleOwner.current
     val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
     val hasScanned = remember { AtomicBoolean(false) }
+    val barcodeScanner = remember {
+        BarcodeScanning.getClient(
+            BarcodeScannerOptions.Builder().setBarcodeFormats(Barcode.FORMAT_QR_CODE).build()
+        )
+    }
 
     DisposableEffect(Unit) {
         onDispose {
             try {
                 cameraExecutor.shutdown()
+            } catch (ignored: Exception) {}
+            try {
+                barcodeScanner.close()
             } catch (ignored: Exception) {}
             try {
                 val providerFuture = ProcessCameraProvider.getInstance(context)
@@ -76,7 +85,6 @@ fun QrScannerView(
                         it.setSurfaceProvider(previewView.surfaceProvider)
                     }
 
-                    val barcodeScanner = BarcodeScanning.getClient()
                     @Suppress("DEPRECATION")
                     val imageAnalysis = ImageAnalysis.Builder()
                         .setTargetResolution(Size(1280, 720))

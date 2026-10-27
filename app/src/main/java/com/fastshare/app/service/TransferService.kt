@@ -4,19 +4,16 @@ import android.app.*
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
-import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import com.fastshare.app.MainActivity
-import com.fastshare.app.R
+import com.fastshare.app.util.TransferLocks
 
 class TransferService : Service() {
 
-    private var wakeLock: PowerManager.WakeLock? = null
-    private var wifiLock: WifiManager.WifiLock? = null
+    private var locks: TransferLocks? = null
 
     companion object {
         const val CHANNEL_ID = "fastshare_transfer_channel"
@@ -114,62 +111,12 @@ class TransferService : Service() {
     }
 
     private fun acquireLocks() {
-        try {
-            val powerManager = getSystemService(Context.POWER_SERVICE) as? PowerManager
-            if (wakeLock == null) {
-                wakeLock = powerManager?.newWakeLock(
-                    PowerManager.PARTIAL_WAKE_LOCK,
-                    "FastShare:ForegroundWakeLock"
-                )?.apply {
-                    setReferenceCounted(false)
-                    acquire(24 * 60 * 60 * 1000L) // 24 hours max
-                }
-            }
-
-            val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
-            if (wifiLock == null) {
-                wifiLock = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    wifiManager?.createWifiLock(
-                        WifiManager.WIFI_MODE_FULL_LOW_LATENCY,
-                        "FastShare:ForegroundWifiLock"
-                    )?.apply {
-                        setReferenceCounted(false)
-                        acquire()
-                    }
-                } else {
-                    @Suppress("DEPRECATION")
-                    wifiManager?.createWifiLock(
-                        WifiManager.WIFI_MODE_FULL_HIGH_PERF,
-                        "FastShare:ForegroundWifiLock"
-                    )?.apply {
-                        setReferenceCounted(false)
-                        acquire()
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
+        if (locks == null) locks = TransferLocks(this, "Foreground", wakeTimeoutMs = 24 * 60 * 60 * 1000L)
     }
 
     private fun releaseLocks() {
-        try {
-            if (wakeLock?.isHeld == true) {
-                wakeLock?.release()
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-        wakeLock = null
-
-        try {
-            if (wifiLock?.isHeld == true) {
-                wifiLock?.release()
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-        wifiLock = null
+        locks?.release()
+        locks = null
     }
 
     private fun createNotificationChannel() {

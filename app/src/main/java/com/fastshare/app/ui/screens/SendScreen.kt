@@ -89,6 +89,50 @@ enum class CategoryTab(val label: String, val icon: androidx.compose.ui.graphics
     CONTACTS("Contacts", Icons.Default.Contacts, AccentEmerald)
 }
 
+/**
+ * Updates (or creates) the transfer row for [name] with that file's own progress, so each row's
+ * bar shows per-file progress rather than the whole batch's.
+ */
+internal fun upsertProgressRecord(
+    records: MutableList<TransferRecord>,
+    direction: TransferDirection,
+    name: String,
+    bytes: Long,
+    size: Long,
+    speedMbPerSec: Double
+) {
+    val fileProgress = if (size > 0) (bytes.toFloat() / size).coerceIn(0f, 1f) else 0f
+    val status = if (size > 0 && bytes >= size) TransferItemStatus.COMPLETED else TransferItemStatus.TRANSFERRING
+    val index = records.indexOfFirst {
+        it.name == name && it.direction == direction && it.status != TransferItemStatus.COMPLETED
+    }.takeIf { it >= 0 } ?: records.indexOfFirst { it.name == name && it.direction == direction }
+
+    if (index >= 0) {
+        records[index] = records[index].copy(
+            status = status,
+            bytesTransferred = bytes,
+            progress = fileProgress,
+            speedMbPerSec = speedMbPerSec
+        )
+    } else {
+        records.add(
+            0,
+            TransferRecord(
+                name = name,
+                size = size,
+                direction = direction,
+                status = status,
+                bytesTransferred = bytes,
+                progress = fileProgress,
+                speedMbPerSec = speedMbPerSec
+            )
+        )
+    }
+}
+
+/** Peers ping every 5s and transfers count as activity, so 20s of silence means the peer is gone. */
+private const val PEER_SILENCE_TIMEOUT_MS = 45_000L
+
 private fun checkMediaImagesPermission(context: Context): Boolean {
     return when {
         Build.VERSION.SDK_INT >= 34 -> {
@@ -156,6 +200,7 @@ fun SendScreen(
     var isClientConnected by remember { mutableStateOf(false) }
     var connectedHostUrl by remember { mutableStateOf("http://192.168.43.1:8080") }
     var clientTransferState by remember { mutableStateOf<TransferState>(TransferState.Idle) }
+    var isClientDownloadLoopActive by remember { mutableStateOf(false) }
     val serverReceivedFiles = remember { mutableStateListOf<ReceivedFile>() }
     val clientReceivedFiles = remember { mutableStateListOf<ReceivedFile>() }
 
@@ -174,7 +219,29 @@ fun SendScreen(
     val currentServer = activeFileServer ?: fileServer
     val isPeerConnectedReactive = (currentServer?.isPeerConnectedState?.value == true) || (currentServer?.isPeerConnected == true)
     val isConnected = isHostConnected || isClientConnected || isPeerConnectedReactive
-    val activeTransferState = if (isClientConnected) clientTransferState else transferState
+    // Progress of files the connected peer is pushing to our server.
+    var hostIncomingState by remember { mutableStateOf<TransferState>(TransferState.Idle) }
+    val activeTransferState = when {
+        isClientConnected -> clientTransferState
+        hostIncomingState is TransferState.Transferring -> hostIncomingState
+        else -> transferState
+    }
+
+    val isTransferringNow = activeTransferState is TransferState.Transferring
+    LaunchedEffect(isTransferringNow) {
+        if (isTransferringNow) showTransferringSheet = true
+    }
+
+    // A new connection starts a fresh transfer list; files queued for this peer are kept.
+    LaunchedEffect(isConnected) {
+        if (isConnected) {
+            sessionTransferRecords.removeAll {
+                it.status == TransferItemStatus.COMPLETED || it.status == TransferItemStatus.FAILED
+            }
+            clientReceivedFiles.clear()
+            serverReceivedFiles.clear()
+        }
+    }
 
     // Permission check for Photos & Videos (including Android 14 visual user selected)
     var hasMediaPermission by remember { mutableStateOf(checkMediaImagesPermission(context)) }
@@ -206,17 +273,24 @@ fun SendScreen(
         }
     }
 
-    LaunchedEffect(pagerState.currentPage) {
-        val tab = categoryTabs[pagerState.currentPage]
+    // targetPage changes once per fling (currentPage flips mid-drag), so the tab bar and the
+    // state it drives don't recompose while the finger is still moving.
+    LaunchedEffect(pagerState.targetPage) {
+        val tab = categoryTabs[pagerState.targetPage]
         if (selectedTab != tab) {
             selectedTab = tab
             searchQuery = ""
         }
-        tabListState.animateScrollToItem(pagerState.currentPage)
+        tabListState.animateScrollToItem(pagerState.targetPage)
     }
 
+    // Preload every tab up front (sequentially, default tab first) so swiping never waits on a query.
     LaunchedEffect(Unit) {
         if (appsList.isEmpty()) appsList = mediaRepo.loadInstalledApps()
+        if (photosList.isEmpty()) photosList = mediaRepo.loadPhotos()
+        if (videosList.isEmpty()) videosList = mediaRepo.loadVideos()
+        if (audiosList.isEmpty()) audiosList = mediaRepo.loadAudios()
+        if (contactsList.isEmpty()) contactsList = mediaRepo.loadContacts()
     }
 
     // Load data based on tab
@@ -280,30 +354,22 @@ fun SendScreen(
             }
         }
         if (isClientConnected) {
-            if (notifyPeer && connectedHostUrl.isNotEmpty()) {
-                coroutineScope.launch(kotlinx.coroutines.Dispatchers.IO) {
-                    try {
-                        val discUrl = java.net.URL("$connectedHostUrl/disconnect")
-                        val conn = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && wifiConnector.activeNetwork != null) {
-                            wifiConnector.activeNetwork!!.openConnection(discUrl) as java.net.HttpURLConnection
-                        } else {
-                            discUrl.openConnection() as java.net.HttpURLConnection
-                        }
-                        conn.connectTimeout = 1500
-                        conn.readTimeout = 1500
-                        conn.requestMethod = "GET"
-                        conn.responseCode
-                    } catch (ignored: Exception) {}
-                }
+            if (notifyPeer) {
+                wifiConnector.disconnectFromPeer(connectedHostUrl)
+            } else {
+                wifiConnector.disconnect()
             }
-            wifiConnector.disconnect()
+            TransferService.stop(context)
         }
         fileDownloader.activeNetwork = null
         fileUploader.activeNetwork = null
+        isClientDownloadLoopActive = false
+        fileDownloader.clearSession()
         isHostConnected = false
         isClientConnected = false
         peerDeviceName = ""
         clientTransferState = TransferState.Idle
+        hostIncomingState = TransferState.Idle
         showTransferringSheet = false
         selectedItems.clear()
         Toast.makeText(context, toastMessage, Toast.LENGTH_SHORT).show()
@@ -326,11 +392,37 @@ fun SendScreen(
                 val s = activeFileServer ?: fileServer
                 if (s != null && s.isPeerConnected) {
                     val silenceDuration = System.currentTimeMillis() - s.lastPeerActivityTime
-                    if (silenceDuration > 60000L) {
+                    if (silenceDuration > PEER_SILENCE_TIMEOUT_MS) {
                         disconnectDevice(notifyPeer = false, toastMessage = "Peer device disconnected")
                         break
                     }
                 }
+            }
+        }
+    }
+
+    // Heartbeat while connected as a client, so the host knows we're alive and we learn if it left.
+    LaunchedEffect(isClientConnected) {
+        if (!isClientConnected) return@LaunchedEffect
+        // Foreground service + wake/Wi-Fi locks for the whole session; without it the CPU sleeps
+        // when the screen locks, heartbeats stop and the host drops us.
+        TransferService.start(
+            context,
+            title = "FastShare: Connected",
+            message = "Connected to ${peerDeviceName.ifEmpty { "peer" }}. Screen can be locked safely."
+        )
+        var failures = 0
+        while (isClientConnected) {
+            kotlinx.coroutines.delay(5000)
+            val url = connectedHostUrl
+            if (url.isEmpty()) continue
+            val code = withContext(Dispatchers.IO) {
+                wifiConnector.ping(url, "${Build.MANUFACTURER} ${Build.MODEL}".trim())
+            }
+            failures = if (code == null) failures + 1 else 0
+            if (code == 410 || failures >= 8) {
+                disconnectDevice(notifyPeer = false, toastMessage = "Peer device disconnected")
+                break
             }
         }
     }
@@ -447,6 +539,7 @@ fun SendScreen(
                 }
 
                 var serverInstance: FileServer? = null
+                var lastNotificationTime = 0L
                 val server = FileServer(
                     context = context,
                     port = serverPort,
@@ -467,28 +560,22 @@ fun SendScreen(
                         val currentQr = currentQrBitmap ?: android.graphics.Bitmap.createBitmap(1, 1, android.graphics.Bitmap.Config.ARGB_8888)
                         serverInstance?.let { s -> onStartServer(s, currentQr, progressState) }
 
-                        val existingIndex = sessionTransferRecords.indexOfFirst {
-                            it.name == fileName && it.direction == TransferDirection.SENDING
-                        }
-                        if (existingIndex >= 0) {
-                            val cur = sessionTransferRecords[existingIndex]
-                            val fileProgress = if (currentSize > 0) (currentBytes.toFloat() / currentSize.toFloat()).coerceIn(0f, 1f) else 0f
-                            val status = if (currentBytes >= currentSize && currentSize > 0) TransferItemStatus.COMPLETED else TransferItemStatus.TRANSFERRING
-                            sessionTransferRecords[existingIndex] = cur.copy(
-                                status = status,
-                                bytesTransferred = currentBytes,
-                                progress = fileProgress,
-                                speedMbPerSec = speed
+                        upsertProgressRecord(
+                            sessionTransferRecords, TransferDirection.SENDING,
+                            fileName, currentBytes, currentSize, speed
+                        )
+
+                        val now = System.currentTimeMillis()
+                        if (now - lastNotificationTime >= com.fastshare.app.util.NOTIFICATION_INTERVAL_MS) {
+                            lastNotificationTime = now
+                            val percent = (progress * 100).toInt()
+                            TransferService.update(
+                                context,
+                                title = "FastShare: Sending ($percent%)",
+                                message = "$fileIndex/$totalFilesCount: $fileName • ${String.format("%.1f", speed)} MB/s",
+                                progress = percent
                             )
                         }
-
-                        val percent = (progress * 100).toInt()
-                        TransferService.update(
-                            context,
-                            title = "FastShare: Sending ($percent%)",
-                            message = "$fileIndex/$totalFilesCount: $fileName • ${String.format("%.1f", speed)} MB/s",
-                            progress = percent
-                        )
                     },
                     onBatchComplete = {
                         val completedState = TransferState.Completed(
@@ -534,19 +621,44 @@ fun SendScreen(
                         disconnectDevice(notifyPeer = false, toastMessage = "Peer device disconnected")
                     }
                 }
+                server.onUploadProgress = { name, bytes, total, speed ->
+                    hostIncomingState = if (total in 1..bytes) {
+                        TransferState.Idle
+                    } else {
+                        TransferState.Transferring(
+                            currentFileName = name,
+                            currentFileIndex = 1,
+                            totalFiles = 1,
+                            currentFileBytes = bytes,
+                            currentFileSize = total,
+                            overallBytes = bytes,
+                            overallTotalBytes = total,
+                            speedMbPerSec = speed,
+                            progress = if (total > 0) (bytes.toFloat() / total).coerceIn(0f, 1f) else 0f
+                        )
+                    }
+                    upsertProgressRecord(
+                        sessionTransferRecords, TransferDirection.RECEIVING,
+                        name, bytes, total, speed
+                    )
+                }
                 server.onFileReceived = { name, size, path ->
+                    hostIncomingState = TransferState.Idle
                     serverReceivedFiles.add(ReceivedFile(name, size, path))
-                    sessionTransferRecords.add(
-                        TransferRecord(
-                            name = name,
-                            size = size,
-                            direction = TransferDirection.RECEIVING,
+                    upsertProgressRecord(
+                        sessionTransferRecords, TransferDirection.RECEIVING,
+                        name, size, size, 0.0
+                    )
+                    val index = sessionTransferRecords.indexOfFirst {
+                        it.name == name && it.direction == TransferDirection.RECEIVING
+                    }
+                    if (index >= 0) {
+                        sessionTransferRecords[index] = sessionTransferRecords[index].copy(
                             status = TransferItemStatus.COMPLETED,
-                            bytesTransferred = size,
                             progress = 1f,
                             path = path
                         )
-                    )
+                    }
                 }
 
                 try {
@@ -608,9 +720,7 @@ fun SendScreen(
         }
     }
 
-    fun startClientDownload(serverUrl: String) {
-        clientTransferState = TransferState.Starting("Fetching files manifest...")
-        coroutineScope.launch {
+    suspend fun downloadPendingFromHost(serverUrl: String) {
             fileDownloader.downloadBatch(
                 serverBaseUrl = serverUrl,
                 callback = object : FileDownloader.BatchDownloadCallback {
@@ -636,32 +746,10 @@ fun SendScreen(
                             speedMbPerSec = speedMbPerSec,
                             progress = progress
                         )
-
-                        val existingIndex = sessionTransferRecords.indexOfFirst {
-                            it.name == currentFileName && it.direction == TransferDirection.RECEIVING
-                        }
-                        if (existingIndex >= 0) {
-                            val cur = sessionTransferRecords[existingIndex]
-                            sessionTransferRecords[existingIndex] = cur.copy(
-                                status = TransferItemStatus.TRANSFERRING,
-                                bytesTransferred = currentFileBytes,
-                                progress = progress,
-                                speedMbPerSec = speedMbPerSec
-                            )
-                        } else {
-                            sessionTransferRecords.add(
-                                0,
-                                TransferRecord(
-                                    name = currentFileName,
-                                    size = currentFileSize,
-                                    direction = TransferDirection.RECEIVING,
-                                    status = TransferItemStatus.TRANSFERRING,
-                                    bytesTransferred = currentFileBytes,
-                                    progress = progress,
-                                    speedMbPerSec = speedMbPerSec
-                                )
-                            )
-                        }
+                        upsertProgressRecord(
+                            sessionTransferRecords, TransferDirection.RECEIVING,
+                            currentFileName, currentFileBytes, currentFileSize, speedMbPerSec
+                        )
                     }
 
                     override fun onFileDownloaded(fileName: String, fileSize: Long, filePath: String) {
@@ -700,23 +788,28 @@ fun SendScreen(
                         totalBytes: Long,
                         targetDirectory: String
                     ) {
-                        clientTransferState = TransferState.Completed(
-                            title = title,
-                            fileCount = fileCount,
-                            totalBytes = totalBytes,
-                            destinationPath = targetDirectory
-                        )
-                        val targetDir = File(targetDirectory)
-                        if (targetDir.exists() && targetDir.isDirectory) {
-                            targetDir.listFiles()?.forEach { f ->
-                                if (clientReceivedFiles.none { it.path == f.absolutePath }) {
-                                    clientReceivedFiles.add(ReceivedFile(f.name, f.length(), f.absolutePath))
-                                }
-                            }
+                        // fileCount == 0 is an idle poll (nothing new queued); keep the last state visible.
+                        if (fileCount > 0) {
+                            clientTransferState = TransferState.Completed(
+                                title = title,
+                                fileCount = fileCount,
+                                totalBytes = totalBytes,
+                                destinationPath = targetDirectory
+                            )
+                        } else if (clientTransferState is TransferState.Starting) {
+                            clientTransferState = TransferState.Idle
                         }
                     }
 
                     override fun onError(message: String) {
+                        if (message == "PEER_DISCONNECTED") {
+                            disconnectDevice(notifyPeer = false, toastMessage = "Peer device disconnected")
+                            return
+                        }
+                        // A failed idle poll is not a failed transfer; the heartbeat detects real drops.
+                        if (clientTransferState !is TransferState.Transferring &&
+                            clientTransferState !is TransferState.Starting
+                        ) return
                         clientTransferState = TransferState.Error(message)
                         val activeIdx = sessionTransferRecords.indexOfFirst {
                             it.status == TransferItemStatus.TRANSFERRING && it.direction == TransferDirection.RECEIVING
@@ -731,6 +824,22 @@ fun SendScreen(
                     }
                 }
             )
+    }
+
+    /**
+     * Keeps polling the host for new files while connected, so files the sender queues later
+     * (or sends after an empty start) are picked up too, not just the first batch.
+     */
+    fun startClientDownload(serverUrl: String) {
+        connectedHostUrl = serverUrl
+        if (isClientDownloadLoopActive) return
+        isClientDownloadLoopActive = true
+        coroutineScope.launch {
+            while (isClientConnected && isClientDownloadLoopActive) {
+                downloadPendingFromHost(connectedHostUrl)
+                delay(1500)
+            }
+            isClientDownloadLoopActive = false
         }
     }
 
@@ -852,11 +961,12 @@ fun SendScreen(
                                     isClientConnected = true
                                     connectedHostUrl = resolvedUrl
                                     peerDeviceName = remoteModel
-                                    if (filesCount > 0) {
-                                        startClientDownload(resolvedUrl)
+                                    clientTransferState = if (filesCount > 0) {
+                                        TransferState.Starting("Fetching files...")
                                     } else {
-                                        clientTransferState = TransferState.Idle
+                                        TransferState.Idle
                                     }
+                                    startClientDownload(resolvedUrl)
                                 }
                             } else {
                                 withContext(kotlinx.coroutines.Dispatchers.Main) {
@@ -932,19 +1042,10 @@ fun SendScreen(
                                 speedMbPerSec = speedMbPerSec,
                                 progress = progress
                             )
-
-                            val existingIndex = sessionTransferRecords.indexOfFirst {
-                                it.name == currentFileName && it.direction == TransferDirection.SENDING
-                            }
-                            if (existingIndex >= 0) {
-                                val cur = sessionTransferRecords[existingIndex]
-                                sessionTransferRecords[existingIndex] = cur.copy(
-                                    status = TransferItemStatus.TRANSFERRING,
-                                    bytesTransferred = currentFileBytes,
-                                    progress = progress,
-                                    speedMbPerSec = speedMbPerSec
-                                )
-                            }
+                            upsertProgressRecord(
+                                sessionTransferRecords, TransferDirection.SENDING,
+                                currentFileName, currentFileBytes, currentFileSize, speedMbPerSec
+                            )
                         }
 
                         override fun onFileUploaded(fileName: String, fileIndex: Int, totalFiles: Int) {
@@ -1007,46 +1108,6 @@ fun SendScreen(
                     color = Color.White,
                     modifier = Modifier.weight(1f)
                 )
-
-                // Requirement 3: Once connected, show option to disconnect device
-                if (isConnected) {
-                    Surface(
-                        onClick = { showDisconnectDialog = true },
-                        shape = RoundedCornerShape(14.dp),
-                        color = Color(0xFFDC2626).copy(alpha = 0.25f),
-                        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFEF4444)),
-                        modifier = Modifier.height(30.dp)
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(16.dp)
-                                    .clip(CircleShape)
-                                    .background(Color(0xFFEF4444)),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Close,
-                                    contentDescription = "Disconnect",
-                                    tint = Color.White,
-                                    modifier = Modifier.size(11.dp)
-                                )
-                            }
-                            Spacer(modifier = Modifier.width(5.dp))
-                            Text(
-                                text = "Disconnect",
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = Color.White
-                            )
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.width(6.dp))
-                }
 
                 // Transfer records launcher / status icon button
                 if (isConnected || sessionTransferRecords.isNotEmpty()) {
@@ -1170,19 +1231,25 @@ fun SendScreen(
             // Category Content with smooth horizontal swipe gestures
             HorizontalPager(
                 state = pagerState,
+                // Keep neighbours composed so a swipe reveals a ready page instead of building it mid-gesture.
+                beyondViewportPageCount = 1,
+                key = { categoryTabs[it].name },
                 modifier = Modifier.weight(1f)
             ) { page ->
                 val pageTab = categoryTabs[page]
                 when (pageTab) {
                         CategoryTab.APPS -> {
-                            val filteredApps = if (searchQuery.isEmpty()) appsList else appsList.filter {
-                                it.name.contains(searchQuery, ignoreCase = true)
+                            val filteredApps = remember(appsList, searchQuery) {
+                                if (searchQuery.isEmpty()) appsList else appsList.filter {
+                                    it.name.contains(searchQuery, ignoreCase = true)
+                                }
                             }
                             AppsGrid(
                                 apps = filteredApps,
                                 selectedItems = selectedItems,
                                 onToggle = { app ->
-                                    val existing = selectedItems.values.firstOrNull { it.relativePath == "${app.name}.apk" }
+                                    val uri = appUri(app)
+                                    val existing = selectedItems.values.firstOrNull { it.uri == uri }
                                     if (existing != null) {
                                         selectedItems.remove(existing.id)
                                     } else {
@@ -1234,30 +1301,7 @@ fun SendScreen(
                                             selectedItems[item.id] = item
                                         }
                                     },
-                                    onToggleDay = { dayGroup ->
-                                        val allDaySelected = dayGroup.photos.isNotEmpty() && dayGroup.photos.all { photo ->
-                                            selectedItems.values.any { it.uri == photo.uri }
-                                        }
-                                        if (allDaySelected) {
-                                            val urisToRemove = dayGroup.photos.map { it.uri }.toSet()
-                                            val toRemoveIds = selectedItems.filter { it.value.uri in urisToRemove }.keys.toList()
-                                            toRemoveIds.forEach { selectedItems.remove(it) }
-                                        } else {
-                                            dayGroup.photos.forEach { photo ->
-                                                if (!selectedItems.values.any { it.uri == photo.uri }) {
-                                                    val item = SharedFileItem(
-                                                        id = UUID.randomUUID().toString(),
-                                                        uri = photo.uri,
-                                                        name = photo.name,
-                                                        relativePath = photo.name,
-                                                        size = photo.size,
-                                                        mimeType = photo.mimeType
-                                                    )
-                                                    selectedItems[item.id] = item
-                                                }
-                                            }
-                                        }
-                                    }
+                                    onToggleDay = { dayGroup -> toggleDayPhotos(selectedItems, dayGroup) }
                                 )
                             }
                         }
@@ -1355,15 +1399,18 @@ fun SendScreen(
                         }
 
                         CategoryTab.CONTACTS -> {
-                            val filteredContacts = if (searchQuery.isEmpty()) contactsList else contactsList.filter {
-                                it.name.contains(searchQuery, ignoreCase = true) || it.phone.contains(searchQuery)
+                            val filteredContacts = remember(contactsList, searchQuery) {
+                                if (searchQuery.isEmpty()) contactsList else contactsList.filter {
+                                    it.name.contains(searchQuery, ignoreCase = true) || it.phone.contains(searchQuery)
+                                }
                             }
                             ContactsList(
                                 contacts = filteredContacts,
                                 selectedItems = selectedItems,
                                 onToggle = { contact ->
                                     coroutineScope.launch {
-                                        val existing = selectedItems.values.firstOrNull { it.name.startsWith(contact.name) }
+                                        val vcfName = MediaRepository.contactVcfName(contact)
+                                        val existing = selectedItems.values.firstOrNull { it.name == vcfName }
                                         if (existing != null) {
                                             selectedItems.remove(existing.id)
                                         } else {
@@ -1376,8 +1423,10 @@ fun SendScreen(
                         }
 
                         CategoryTab.MUSIC -> {
-                            val filteredAudios = if (searchQuery.isEmpty()) audiosList else audiosList.filter {
-                                it.name.contains(searchQuery, ignoreCase = true) || it.artist.contains(searchQuery, ignoreCase = true)
+                            val filteredAudios = remember(audiosList, searchQuery) {
+                                if (searchQuery.isEmpty()) audiosList else audiosList.filter {
+                                    it.name.contains(searchQuery, ignoreCase = true) || it.artist.contains(searchQuery, ignoreCase = true)
+                                }
                             }
                             AudiosList(
                                 audios = filteredAudios,
@@ -1421,8 +1470,9 @@ fun SendScreen(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 24.dp, vertical = 14.dp),
-                    horizontalArrangement = Arrangement.spacedBy(16.dp, Alignment.CenterHorizontally),
+                        .navigationBarsPadding()
+                        .padding(start = 20.dp, end = 20.dp, top = 12.dp, bottom = 24.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterHorizontally),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     // SEND Button (pill button, can be tapped with or without selected files)
@@ -1445,22 +1495,21 @@ fun SendScreen(
                         modifier = Modifier
                             .weight(1f)
                             .height(52.dp),
-                        shape = RoundedCornerShape(26.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = XenderGreenLight),
-                        border = androidx.compose.foundation.BorderStroke(2.dp, Color.White),
-                        elevation = ButtonDefaults.buttonElevation(defaultElevation = 6.dp)
+                        shape = RoundedCornerShape(14.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = RubyRed),
+                        elevation = ButtonDefaults.buttonElevation(defaultElevation = 0.dp)
                     ) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.Send,
                             contentDescription = null,
                             tint = Color.White,
-                            modifier = Modifier.size(20.dp)
+                            modifier = Modifier.size(18.dp)
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = if (totalSelectedCount > 0) "SEND ($totalSelectedCount)" else "SEND",
+                            text = if (totalSelectedCount > 0) "Send ($totalSelectedCount)" else "Send",
                             fontSize = 15.sp,
-                            fontWeight = FontWeight.Bold,
+                            fontWeight = FontWeight.SemiBold,
                             color = Color.White
                         )
                     }
@@ -1473,23 +1522,23 @@ fun SendScreen(
                         modifier = Modifier
                             .weight(1f)
                             .height(52.dp),
-                        shape = RoundedCornerShape(26.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = XenderGreenLight),
-                        border = androidx.compose.foundation.BorderStroke(2.dp, Color.White),
-                        elevation = ButtonDefaults.buttonElevation(defaultElevation = 6.dp)
+                        shape = RoundedCornerShape(14.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = SurfaceElevated),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, BorderSubtle),
+                        elevation = ButtonDefaults.buttonElevation(defaultElevation = 0.dp)
                     ) {
                         Icon(
                             imageVector = Icons.Default.Download,
                             contentDescription = null,
-                            tint = Color.White,
-                            modifier = Modifier.size(20.dp)
+                            tint = TextPrimary,
+                            modifier = Modifier.size(18.dp)
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = "RECEIVE",
+                            text = "Receive",
                             fontSize = 15.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = Color.White
+                            fontWeight = FontWeight.SemiBold,
+                            color = TextPrimary
                         )
                     }
                 }
@@ -1501,10 +1550,10 @@ fun SendScreen(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(horizontal = 14.dp, vertical = 6.dp),
-                        shape = RoundedCornerShape(20.dp),
-                        color = SurfaceElevated.copy(alpha = 0.98f),
-                        shadowElevation = 10.dp,
-                        border = androidx.compose.foundation.BorderStroke(1.5.dp, RubyRedLight)
+                        shape = RoundedCornerShape(16.dp),
+                        color = SurfaceElevated,
+                        shadowElevation = 4.dp,
+                        border = androidx.compose.foundation.BorderStroke(1.dp, BorderSubtle)
                     ) {
                         Row(
                             modifier = Modifier
@@ -1515,8 +1564,8 @@ fun SendScreen(
                         ) {
                             Column {
                                 Text(
-                                    text = "⚡ $totalSelectedCount items (${formatBytes(totalSelectedSize)})",
-                                    fontWeight = FontWeight.ExtraBold,
+                                    text = "$totalSelectedCount items (${formatBytes(totalSelectedSize)})",
+                                    fontWeight = FontWeight.Bold,
                                     color = TextPrimary,
                                     fontSize = 14.sp
                                 )
@@ -1528,7 +1577,7 @@ fun SendScreen(
                             }
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 TextButton(onClick = { selectedItems.clear() }) {
-                                    Text("Clear", color = Color(0xFFEF4444), fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                    Text("Clear", color = TextSecondary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                                 }
                                 Spacer(Modifier.width(6.dp))
                                 Button(
@@ -1561,11 +1610,13 @@ fun SendScreen(
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .padding(horizontal = 16.dp, vertical = 8.dp),
+                                .navigationBarsPadding()
+                                .padding(start = 16.dp, end = 16.dp, top = 10.dp, bottom = 16.dp),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
                             Row(
+                                modifier = Modifier.weight(1f),
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
@@ -1574,7 +1625,7 @@ fun SendScreen(
                                     modifier = Modifier
                                         .size(36.dp)
                                         .clip(CircleShape)
-                                        .background(Color(0xFFF97316)),
+                                        .background(SurfaceElevated),
                                     contentAlignment = Alignment.Center
                                 ) {
                                     Text("🦊", fontSize = 18.sp)
@@ -1593,7 +1644,7 @@ fun SendScreen(
                                     modifier = Modifier
                                         .size(36.dp)
                                         .clip(CircleShape)
-                                        .background(Color(0xFFEAB308)),
+                                        .background(SurfaceElevated),
                                     contentAlignment = Alignment.Center
                                 ) {
                                     Text("🦌", fontSize = 18.sp)
@@ -1611,64 +1662,68 @@ fun SendScreen(
                                         modifier = Modifier.padding(horizontal = 10.dp, vertical = 2.dp)
                                     ) {
                                         Text(
-                                            text = peerDeviceName.ifEmpty { "Pixel6a" },
+                                            text = peerDeviceName.ifEmpty { "Peer device" },
                                             fontSize = 12.sp,
                                             fontWeight = FontWeight.SemiBold,
-                                            color = TextPrimary
+                                            color = TextPrimary,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
                                         )
                                     }
                                 }
                             }
 
-                            // Disconnect Cross Button (Right side)
-                            IconButton(
-                                onClick = { showDisconnectDialog = true },
-                                modifier = Modifier.size(34.dp)
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
-                                Icon(
-                                    imageVector = Icons.Default.Close,
-                                    contentDescription = "Disconnect",
-                                    tint = TextSecondary,
-                                    modifier = Modifier.size(20.dp)
-                                )
-                            }
-                        }
-                    }
+                                // Transfers / history (shows live % while transferring)
+                                Surface(
+                                    onClick = { showTransferringSheet = true },
+                                    shape = CircleShape,
+                                    color = RubyRed,
+                                    modifier = Modifier.size(40.dp)
+                                ) {
+                                    Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
+                                        if (activeTransferState is TransferState.Transferring) {
+                                            CircularProgressIndicator(
+                                                progress = { liveProgress },
+                                                color = Color.White,
+                                                trackColor = Color.White.copy(alpha = 0.3f),
+                                                strokeWidth = 2.5.dp,
+                                                modifier = Modifier.fillMaxSize().padding(2.dp)
+                                            )
+                                            Text(
+                                                text = "${(liveProgress * 100).toInt()}%",
+                                                fontSize = 9.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                color = Color.White
+                                            )
+                                        } else {
+                                            Icon(
+                                                imageVector = Icons.Default.SwapVert,
+                                                contentDescription = "Transfers",
+                                                tint = Color.White,
+                                                modifier = Modifier.size(22.dp)
+                                            )
+                                        }
+                                    }
+                                }
 
-                    // Floating Circular Transfer Button (Bottom Left, directly above the connected bar)
-                    Surface(
-                        onClick = { showTransferringSheet = true },
-                        shape = CircleShape,
-                        color = RubyRed,
-                        border = androidx.compose.foundation.BorderStroke(2.5.dp, Color.White),
-                        shadowElevation = 10.dp,
-                        modifier = Modifier
-                            .padding(start = 16.dp, bottom = 56.dp)
-                            .size(52.dp)
-                            .align(Alignment.BottomStart)
-                    ) {
-                        Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
-                            if (activeTransferState is TransferState.Transferring) {
-                                CircularProgressIndicator(
-                                    progress = { liveProgress },
-                                    color = Color.White,
-                                    trackColor = Color.White.copy(alpha = 0.3f),
-                                    strokeWidth = 3.dp,
-                                    modifier = Modifier.fillMaxSize()
-                                )
-                                Text(
-                                    text = "${(liveProgress * 100).toInt()}%",
-                                    fontSize = 10.sp,
-                                    fontWeight = FontWeight.ExtraBold,
-                                    color = Color.White
-                                )
-                            } else {
-                                Icon(
-                                    imageVector = Icons.Default.SwapVert,
-                                    contentDescription = "Transferring",
-                                    tint = Color.White,
-                                    modifier = Modifier.size(26.dp)
-                                )
+                                IconButton(
+                                    onClick = { showDisconnectDialog = true },
+                                    modifier = Modifier
+                                        .size(40.dp)
+                                        .clip(CircleShape)
+                                        .background(SurfaceElevated)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Close,
+                                        contentDescription = "Disconnect",
+                                        tint = TextSecondary,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                }
                             }
                         }
                     }
@@ -2284,7 +2339,7 @@ fun StorageExplorerView(
                             modifier = Modifier
                                 .size(48.dp)
                                 .clip(RoundedCornerShape(12.dp))
-                                .background(Color(0xFF2563EB)),
+                                .background(Color(0xFF3B6FC4)),
                             contentAlignment = Alignment.Center
                         ) {
                             Text("W", color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Black)
@@ -2305,7 +2360,7 @@ fun StorageExplorerView(
                             modifier = Modifier
                                 .size(48.dp)
                                 .clip(RoundedCornerShape(12.dp))
-                                .background(Color(0xFF0EA5E9)),
+                                .background(Color(0xFF3A8FA3)),
                             contentAlignment = Alignment.Center
                         ) {
                             Text("T", color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Black)
@@ -2328,7 +2383,7 @@ fun StorageExplorerView(
                                 modifier = Modifier
                                     .size(48.dp)
                                     .clip(RoundedCornerShape(12.dp))
-                                    .background(Color(0xFF22C55E)),
+                                    .background(Color(0xFF3F9467)),
                                 contentAlignment = Alignment.Center
                             ) {
                                 Icon(Icons.Default.Android, contentDescription = null, tint = Color.White, modifier = Modifier.size(28.dp))
@@ -2361,7 +2416,7 @@ fun StorageExplorerView(
                             modifier = Modifier
                                 .size(48.dp)
                                 .clip(RoundedCornerShape(12.dp))
-                                .background(Color(0xFF38BDF8)),
+                                .background(Color(0xFFA7743A)),
                             contentAlignment = Alignment.Center
                         ) {
                             Icon(Icons.Default.Inventory2, contentDescription = null, tint = Color.White, modifier = Modifier.size(26.dp))
@@ -2382,7 +2437,7 @@ fun StorageExplorerView(
                             modifier = Modifier
                                 .size(48.dp)
                                 .clip(RoundedCornerShape(12.dp))
-                                .background(Color(0xFF3B82F6)),
+                                .background(Color(0xFF5B6779)),
                             contentAlignment = Alignment.Center
                         ) {
                             Icon(Icons.Default.Folder, contentDescription = null, tint = Color.White, modifier = Modifier.size(28.dp))
@@ -2399,11 +2454,14 @@ fun StorageExplorerView(
         }
 
         FilesViewMode.CATEGORY_LIST -> {
-            val filteredCategoryFiles = if (searchQuery.isEmpty()) categoryFiles else categoryFiles.filter {
-                it.name.contains(searchQuery, ignoreCase = true)
+            val filteredCategoryFiles = remember(categoryFiles, searchQuery) {
+                if (searchQuery.isEmpty()) categoryFiles else categoryFiles.filter {
+                    it.name.contains(searchQuery, ignoreCase = true)
+                }
             }
+            val selectedKeys = rememberSelectedFileKeys(selectedItems)
             val allCategorySelected = filteredCategoryFiles.isNotEmpty() && filteredCategoryFiles.all { catFile ->
-                selectedItems.values.any { it.name == catFile.name && it.size == catFile.size }
+                selectedKeys.isFileSelected(catFile.name, catFile.size)
             }
 
             Column(
@@ -2509,8 +2567,8 @@ fun StorageExplorerView(
                         modifier = Modifier.fillMaxSize(),
                         contentPadding = PaddingValues(bottom = 90.dp)
                     ) {
-                        items(filteredCategoryFiles) { fileInfo ->
-                            val isSelected = selectedItems.values.any { it.name == fileInfo.name && it.size == fileInfo.size }
+                        items(filteredCategoryFiles, key = { it.file.absolutePath }) { fileInfo ->
+                            val isSelected = selectedKeys.isFileSelected(fileInfo.name, fileInfo.size)
                             val dateStr = remember(fileInfo.lastModified) {
                                 if (fileInfo.lastModified > 0) {
                                     java.text.SimpleDateFormat("MMM dd, yyyy", java.util.Locale.getDefault()).format(java.util.Date(fileInfo.lastModified))
@@ -2765,21 +2823,22 @@ fun StorageExplorerView(
                         Text("Folder is empty", color = TextMuted, fontSize = 13.sp)
                     }
                 } else {
-                    val filteredDirFiles = if (searchQuery.isEmpty()) directoryFiles else directoryFiles.filter {
-                        it.name.contains(searchQuery, ignoreCase = true)
+                    val filteredDirFiles = remember(directoryFiles, searchQuery) {
+                        if (searchQuery.isEmpty()) directoryFiles else directoryFiles.filter {
+                            it.name.contains(searchQuery, ignoreCase = true)
+                        }
                     }
+                    val selectedKeys = rememberSelectedFileKeys(selectedItems)
 
                     LazyColumn(
                         verticalArrangement = Arrangement.spacedBy(6.dp),
                         modifier = Modifier.fillMaxSize(),
                         contentPadding = PaddingValues(bottom = 90.dp)
                     ) {
-                        items(filteredDirFiles) { item ->
+                        items(filteredDirFiles, key = { it.file.absolutePath }) { item ->
                             val isFolder = item.isDirectory
-                            val isFileSelected = !isFolder && selectedItems.values.any { it.name == item.name && it.size == item.size }
-                            val isFolderSelected = isFolder && selectedItems.values.any {
-                                it.relativePath.startsWith("${item.name}/") || it.name == item.name
-                            }
+                            val isFileSelected = !isFolder && selectedKeys.isFileSelected(item.name, item.size)
+                            val isFolderSelected = isFolder && selectedKeys.isFolderSelected(item.name)
                             val isRowActive = isFileSelected || isFolderSelected
 
                             Row(
@@ -2991,6 +3050,74 @@ fun CategoryTabBar(
     }
 }
 
+/** Set of selected URIs, recomputed only when the selection changes (O(1) lookups per grid cell). */
+@Composable
+internal fun rememberSelectedUris(selectedItems: Map<String, SharedFileItem>): Set<Uri> {
+    val uris by remember(selectedItems) {
+        derivedStateOf { selectedItems.values.mapTo(HashSet()) { it.uri } }
+    }
+    return uris
+}
+
+@Composable
+internal fun rememberSelectedNames(selectedItems: Map<String, SharedFileItem>): Set<String> {
+    val names by remember(selectedItems) {
+        derivedStateOf { selectedItems.values.mapTo(HashSet()) { it.name } }
+    }
+    return names
+}
+
+internal class SelectedFileKeys(
+    private val nameSizes: Set<Pair<String, Long>>,
+    private val names: Set<String>,
+    private val topFolders: Set<String>
+) {
+    fun isFileSelected(name: String, size: Long) = (name to size) in nameSizes
+    fun isFolderSelected(folderName: String) = folderName in topFolders || folderName in names
+}
+
+@Composable
+internal fun rememberSelectedFileKeys(selectedItems: Map<String, SharedFileItem>): SelectedFileKeys {
+    val keys by remember(selectedItems) {
+        derivedStateOf {
+            val values = selectedItems.values
+            SelectedFileKeys(
+                nameSizes = values.mapTo(HashSet()) { it.name to it.size },
+                names = values.mapTo(HashSet()) { it.name },
+                topFolders = values.mapNotNullTo(HashSet()) { item ->
+                    item.relativePath.takeIf { '/' in it }?.substringBefore('/')
+                }
+            )
+        }
+    }
+    return keys
+}
+
+internal fun appUri(app: InstalledAppItem): Uri = Uri.fromFile(File(app.sourceDir))
+
+/** Toggles a photo day group in [selectedItems]; uses a URI set so large days stay O(n). */
+internal fun toggleDayPhotos(selectedItems: MutableMap<String, SharedFileItem>, dayGroup: DayPhotoGroup) {
+    val selectedUris = selectedItems.values.mapTo(HashSet()) { it.uri }
+    val allDaySelected = dayGroup.photos.isNotEmpty() && dayGroup.photos.all { it.uri in selectedUris }
+    if (allDaySelected) {
+        val urisToRemove = dayGroup.photos.mapTo(HashSet()) { it.uri }
+        selectedItems.entries.removeAll { it.value.uri in urisToRemove }
+    } else {
+        for (photo in dayGroup.photos) {
+            if (photo.uri in selectedUris) continue
+            val item = SharedFileItem(
+                id = UUID.randomUUID().toString(),
+                uri = photo.uri,
+                name = photo.name,
+                relativePath = photo.name,
+                size = photo.size,
+                mimeType = photo.mimeType
+            )
+            selectedItems[item.id] = item
+        }
+    }
+}
+
 @Composable
 fun AppsGrid(
     apps: List<InstalledAppItem>,
@@ -3001,6 +3128,7 @@ fun AppsGrid(
         EmptyCategoryView(Icons.Default.Apps, "No user apps found")
         return
     }
+    val selectedUris = rememberSelectedUris(selectedItems)
 
     LazyVerticalGrid(
         columns = GridCells.Fixed(4),
@@ -3009,8 +3137,8 @@ fun AppsGrid(
         verticalArrangement = Arrangement.spacedBy(12.dp),
         modifier = Modifier.fillMaxSize()
     ) {
-        items(apps) { app ->
-            val isSelected = selectedItems.values.any { it.relativePath == "${app.name}.apk" }
+        items(apps, key = { it.packageName }) { app ->
+            val isSelected = appUri(app) in selectedUris
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 modifier = Modifier
@@ -3022,7 +3150,7 @@ fun AppsGrid(
                 Box(contentAlignment = Alignment.TopEnd) {
                     if (app.icon != null) {
                         Image(
-                            painter = rememberAsyncImagePainter(app.icon),
+                            bitmap = app.icon,
                             contentDescription = app.name,
                             modifier = Modifier
                                 .size(54.dp)
@@ -3076,6 +3204,24 @@ fun AppsGrid(
 // Day-Wise Grouped Photos View with Day Header and Day Select Checkbox
 // -----------------------------------------------------------------------------------------
 
+private class PhotoGrouping(val groups: List<DayPhotoGroup>, val rows: List<List<List<MediaItem>>>) {
+    companion object {
+        @Volatile private var lastInput: List<MediaItem>? = null
+        @Volatile private var lastResult: PhotoGrouping? = null
+
+        fun cached(photos: List<MediaItem>): PhotoGrouping? = lastResult.takeIf { lastInput === photos }
+
+        fun compute(photos: List<MediaItem>, repo: MediaRepository): PhotoGrouping {
+            cached(photos)?.let { return it }
+            val groups = repo.groupPhotosByDay(photos)
+            val result = PhotoGrouping(groups, groups.map { it.photos.chunked(3) })
+            lastInput = photos
+            lastResult = result
+            return result
+        }
+    }
+}
+
 @Composable
 fun PhotosDayWiseGrid(
     photos: List<MediaItem>,
@@ -3090,16 +3236,29 @@ fun PhotosDayWiseGrid(
 
     val context = LocalContext.current
     val mediaRepo = remember { MediaRepository(context) }
-    val dayGroups = remember(photos) { mediaRepo.groupPhotosByDay(photos) }
+    // Grouping thousands of photos takes a while; do it off the main thread and cache it, since the
+    // pager disposes and re-creates this page as the user swipes between tabs.
+    val grouped by produceState(initialValue = PhotoGrouping.cached(photos), photos) {
+        value = PhotoGrouping.cached(photos)
+            ?: withContext(Dispatchers.Default) { PhotoGrouping.compute(photos, mediaRepo) }
+    }
+    val grouping = grouped
+    if (grouping == null) {
+        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            CircularProgressIndicator(color = RubyRed)
+        }
+        return
+    }
+    val dayGroups = grouping.groups
+    val dayRows = grouping.rows
+    val selectedUris = rememberSelectedUris(selectedItems)
 
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(bottom = 90.dp)
     ) {
-        dayGroups.forEach { dayGroup ->
-            val allDaySelected = dayGroup.photos.isNotEmpty() && dayGroup.photos.all { photo ->
-                selectedItems.values.any { it.uri == photo.uri }
-            }
+        dayGroups.forEachIndexed { groupIndex, dayGroup ->
+            val allDaySelected = dayGroup.photos.isNotEmpty() && dayGroup.photos.all { it.uri in selectedUris }
 
             // Day Header with Date & Select Day Checkbox
             item(key = "header_${dayGroup.dayKey}_${dayGroup.dateLabel}") {
@@ -3164,8 +3323,7 @@ fun PhotosDayWiseGrid(
             }
 
             // 3-column Photo Grid for this day
-            val chunkedPhotos = dayGroup.photos.chunked(3)
-            items(chunkedPhotos) { rowPhotos ->
+            items(dayRows[groupIndex], key = { "row_${it.first().uri}" }) { rowPhotos ->
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -3173,7 +3331,7 @@ fun PhotosDayWiseGrid(
                     horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
                     for (photo in rowPhotos) {
-                        val isPhotoSelected = selectedItems.values.any { it.uri == photo.uri }
+                        val isPhotoSelected = photo.uri in selectedUris
                         Box(
                             modifier = Modifier
                                 .weight(1f)
@@ -3241,6 +3399,7 @@ fun VideosGrid(
         EmptyCategoryView(Icons.Default.VideoLibrary, "No videos found on device")
         return
     }
+    val selectedUris = rememberSelectedUris(selectedItems)
 
     LazyVerticalGrid(
         columns = GridCells.Fixed(2),
@@ -3249,8 +3408,8 @@ fun VideosGrid(
         verticalArrangement = Arrangement.spacedBy(8.dp),
         modifier = Modifier.fillMaxSize()
     ) {
-        items(videos) { video ->
-            val isSelected = selectedItems.values.any { it.uri == video.uri }
+        items(videos, key = { it.uri.toString() }) { video ->
+            val isSelected = video.uri in selectedUris
             Box(
                 modifier = Modifier
                     .aspectRatio(1.2f)
@@ -3328,14 +3487,15 @@ fun ContactsList(
         EmptyCategoryView(Icons.Default.Contacts, "No contacts found on device")
         return
     }
+    val selectedNames = rememberSelectedNames(selectedItems)
 
     LazyColumn(
         contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 90.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
         modifier = Modifier.fillMaxSize()
     ) {
-        items(contacts) { contact ->
-            val isSelected = selectedItems.values.any { it.name.startsWith(contact.name) }
+        items(contacts, key = { it.phone }) { contact ->
+            val isSelected = MediaRepository.contactVcfName(contact) in selectedNames
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -3552,14 +3712,15 @@ fun AudiosList(
         EmptyCategoryView(Icons.Default.Audiotrack, "No audio files found")
         return
     }
+    val selectedUris = rememberSelectedUris(selectedItems)
 
     LazyColumn(
         contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 8.dp, bottom = 120.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
         modifier = Modifier.fillMaxSize()
     ) {
-        items(audios) { audio ->
-            val isSelected = selectedItems.values.any { it.uri == audio.uri }
+        items(audios, key = { it.uri.toString() }) { audio ->
+            val isSelected = audio.uri in selectedUris
             Row(
                 modifier = Modifier
                     .fillMaxWidth()

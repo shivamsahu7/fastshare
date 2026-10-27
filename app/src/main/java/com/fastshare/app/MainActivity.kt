@@ -42,6 +42,14 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
+        coil.Coil.setImageLoader(
+            coil.ImageLoader.Builder(applicationContext)
+                .components { add(com.fastshare.app.util.MediaThumbnailFetcher.Factory()) }
+                .crossfade(false)
+                .allowRgb565(true)
+                .build()
+        )
+
         hotspotManager = HotspotManager(this)
         wifiConnector = WifiConnector(this)
         fileDownloader = FileDownloader(this)
@@ -77,8 +85,6 @@ fun MainAppNavHost(
     var fileServer by remember { mutableStateOf<com.fastshare.app.server.FileServer?>(null) }
     var transferState by remember { mutableStateOf<TransferState>(TransferState.Idle) }
     var qrBitmap by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
-    val receivedFiles = remember { mutableStateListOf<com.fastshare.app.server.ReceivedFile>() }
-
     val context = androidx.compose.ui.platform.LocalContext.current
     val activity = context as? ComponentActivity
 
@@ -205,9 +211,6 @@ fun MainAppNavHost(
                             fileServer = server
                             qrBitmap = qr
                             transferState = state
-                            server.onFileReceived = { name, size, path ->
-                                receivedFiles.add(com.fastshare.app.server.ReceivedFile(name, size, path))
-                            }
                         },
                         onStopSharing = {
                             stopSharingSession()
@@ -231,7 +234,7 @@ fun MainAppNavHost(
                         qrBitmap = qrBitmap,
                         queuedFileCount = fileServer?.getTotalCount() ?: 0,
                         queuedTotalSize = fileServer?.getTotalSize() ?: 0L,
-                        receivedFiles = receivedFiles,
+                        receivedFiles = fileServer?.receivedFilesState ?: emptyList(),
                         onQueueMoreFiles = {
                             currentScreen = AppScreen.SEND
                         },

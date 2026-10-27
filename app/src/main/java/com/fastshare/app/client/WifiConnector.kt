@@ -10,6 +10,12 @@ import android.net.wifi.WifiConfiguration
 import android.net.wifi.WifiManager
 import android.net.wifi.WifiNetworkSpecifier
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 
 class WifiConnector(private val context: Context) {
 
@@ -27,12 +33,18 @@ class WifiConnector(private val context: Context) {
         fun onFailure(reason: String)
     }
 
+    @Volatile
     var activeNetwork: Network? = null
         private set
+
+    private val connectionGeneration = AtomicInteger(0)
+    private val disconnectExecutor = Executors.newSingleThreadExecutor()
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     @SuppressLint("MissingPermission")
     fun connectToHotspot(ssid: String, password: String, callback: ConnectionCallback) {
         disconnect()
+        connectionGeneration.incrementAndGet()
 
         val cleanSsid = ssid.removeSurrounding("\"")
         val cleanPassword = password.removeSurrounding("\"")
@@ -110,6 +122,46 @@ class WifiConnector(private val context: Context) {
             } catch (e: Exception) {
                 callback.onFailure("Legacy Wi-Fi error: ${e.message}")
             }
+        }
+    }
+
+    /**
+     * Tells the sender we are leaving, *then* drops the hotspot Wi-Fi. Runs on its own thread so it
+     * survives the calling screen leaving composition (which would otherwise drop Wi-Fi first and
+     * the sender would never hear about it).
+     */
+    fun disconnectFromPeer(serverUrl: String?) {
+        val generationAtRequest = connectionGeneration.get()
+        val network = activeNetwork
+        disconnectExecutor.execute {
+            if (!serverUrl.isNullOrEmpty()) {
+                runCatching { request(serverUrl, "/disconnect", network, timeoutMs = 1500) }
+            }
+            // A new connection may have started meanwhile; don't tear that one down.
+            if (connectionGeneration.get() == generationAtRequest) {
+                mainHandler.post {
+                    if (connectionGeneration.get() == generationAtRequest) disconnect()
+                }
+            }
+        }
+    }
+
+    /** Returns the HTTP status of `GET serverUrl/ping`, or null if the sender is unreachable. */
+    fun ping(serverUrl: String, deviceName: String): Int? = runCatching {
+        request(serverUrl, "/ping", activeNetwork, timeoutMs = 2500, deviceName = deviceName)
+    }.getOrNull()
+
+    private fun request(serverUrl: String, path: String, network: Network?, timeoutMs: Int, deviceName: String? = null): Int {
+        val url = URL(serverUrl.trimEnd('/') + path)
+        val conn = (network?.openConnection(url) ?: url.openConnection()) as HttpURLConnection
+        return try {
+            conn.connectTimeout = timeoutMs
+            conn.readTimeout = timeoutMs
+            conn.requestMethod = "GET"
+            if (deviceName != null) conn.setRequestProperty("x-device-name", deviceName)
+            conn.responseCode
+        } finally {
+            conn.disconnect()
         }
     }
 

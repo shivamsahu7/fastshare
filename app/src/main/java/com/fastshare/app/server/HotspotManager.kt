@@ -2,22 +2,35 @@ package com.fastshare.app.server
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.pm.PackageManager
 import android.net.wifi.WifiManager
+import android.net.wifi.p2p.WifiP2pConfig
+import android.net.wifi.p2p.WifiP2pManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
-import android.os.PowerManager
+import com.fastshare.app.util.TransferLocks
 import java.net.Inet4Address
 import java.net.NetworkInterface
+
+private const val DEFAULT_GATEWAY_IP = "192.168.43.1"
+private const val WIFI_DIRECT_GATEWAY_IP = "192.168.49.1"
+private val ALPHANUMERIC = ('a'..'z') + ('A'..'Z') + ('0'..'9')
 
 class HotspotManager(private val context: Context) {
 
     private val wifiManager: WifiManager =
         context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
 
+    private val mainHandler = Handler(Looper.getMainLooper())
     private var reservation: WifiManager.LocalOnlyHotspotReservation? = null
-    private var wakeLock: PowerManager.WakeLock? = null
-    private var wifiLock: WifiManager.WifiLock? = null
+    private var locks: TransferLocks? = null
+
+    private var p2pManager: WifiP2pManager? = null
+    private var p2pChannel: WifiP2pManager.Channel? = null
+    private var p2pActive = false
+    /** Bumped on every start/stop so callbacks from an abandoned attempt are ignored. */
+    private var sessionGeneration = 0
 
     interface Callback {
         fun onHotspotStarted(ssid: String, password: String, localIp: String)
@@ -32,29 +45,123 @@ class HotspotManager(private val context: Context) {
             return
         }
 
-        try {
-            // Acquire locks so hotspot stays alive when screen turns off
-            val powerManager = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
-            wakeLock = powerManager?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "FastShare:HotspotWakeLock")?.apply {
-                setReferenceCounted(false)
-                acquire(2 * 60 * 60 * 1000L) // 2 hrs max
-            }
-            wifiLock = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "FastShare:HotspotWifiLock")?.apply {
-                    setReferenceCounted(false)
-                    acquire()
-                }
-            } else {
-                @Suppress("DEPRECATION")
-                wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "FastShare:HotspotWifiLock")?.apply {
-                    setReferenceCounted(false)
-                    acquire()
-                }
-            }
+        // Keep the hotspot alive when the screen turns off
+        locks?.release()
+        locks = TransferLocks(context, "Hotspot")
+        val generation = ++sessionGeneration
 
+        if (canUseWifiDirect5Ghz()) {
+            startWifiDirectGroup(generation, callback) { startLocalOnlyHotspot(generation, callback) }
+        } else {
+            startLocalOnlyHotspot(generation, callback)
+        }
+    }
+
+    /**
+     * LocalOnlyHotspot runs on 2.4 GHz on most phones (~3-8 MB/s). A Wi-Fi Direct group pinned to
+     * 5 GHz is what other share apps use and is several times faster; legacy clients join it like a
+     * normal WPA2 network, so the receiver's QR/connect flow is unchanged.
+     */
+    private fun canUseWifiDirect5Ghz(): Boolean =
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+            wifiManager.isWifiEnabled &&
+            wifiManager.is5GHzBandSupported &&
+            context.packageManager.hasSystemFeature(PackageManager.FEATURE_WIFI_DIRECT)
+
+    @SuppressLint("MissingPermission")
+    private fun startWifiDirectGroup(generation: Int, callback: Callback, fallback: () -> Unit) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return fallback()
+        val manager = context.applicationContext.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager
+            ?: return fallback()
+
+        val channel = try {
+            manager.initialize(context.applicationContext, Looper.getMainLooper(), null)
+        } catch (e: Exception) {
+            null
+        } ?: return fallback()
+        p2pManager = manager
+        p2pChannel = channel
+
+        fun failOver() {
+            if (generation != sessionGeneration) return
+            releaseWifiDirect()
+            fallback()
+        }
+
+        fun awaitGroup(attempt: Int) {
+            if (generation != sessionGeneration) return
+            try {
+                manager.requestGroupInfo(channel) { group ->
+                    if (generation != sessionGeneration) return@requestGroupInfo
+                    if (group != null && group.isGroupOwner && !group.passphrase.isNullOrEmpty()) {
+                        manager.requestConnectionInfo(channel) { info ->
+                            if (generation != sessionGeneration) return@requestConnectionInfo
+                            val ip = info?.groupOwnerAddress?.hostAddress ?: WIFI_DIRECT_GATEWAY_IP
+                            p2pActive = true
+                            callback.onHotspotStarted(group.networkName, group.passphrase, ip)
+                        }
+                    } else if (attempt < 20) {
+                        mainHandler.postDelayed({ awaitGroup(attempt + 1) }, 250)
+                    } else {
+                        failOver()
+                    }
+                }
+            } catch (e: SecurityException) {
+                failOver()
+            }
+        }
+
+        val suffix = (1..2).map { ALPHANUMERIC.random() }.joinToString("")
+        val passphrase = (1..12).map { ALPHANUMERIC.random() }.joinToString("")
+        val config = try {
+            WifiP2pConfig.Builder()
+                .setNetworkName("DIRECT-$suffix-FastShare")
+                .setPassphrase(passphrase)
+                .setGroupOperatingBand(WifiP2pConfig.GROUP_OWNER_BAND_5GHZ)
+                .build()
+        } catch (e: Exception) {
+            return failOver()
+        }
+
+        val createListener = object : WifiP2pManager.ActionListener {
+            override fun onSuccess() = awaitGroup(0)
+            override fun onFailure(reason: Int) = failOver()
+        }
+
+        try {
+            // Clear any stale group from a previous session first; createGroup fails with BUSY otherwise.
+            manager.removeGroup(channel, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() = manager.createGroup(channel, config, createListener)
+                override fun onFailure(reason: Int) = manager.createGroup(channel, config, createListener)
+            })
+        } catch (e: SecurityException) {
+            failOver()
+        }
+    }
+
+    private fun releaseWifiDirect() {
+        val manager = p2pManager
+        val channel = p2pChannel
+        if (manager != null && channel != null) {
+            runCatching { manager.removeGroup(channel, null) }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) runCatching { channel.close() }
+        }
+        p2pManager = null
+        p2pChannel = null
+        p2pActive = false
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startLocalOnlyHotspot(generation: Int, callback: Callback) {
+        if (generation != sessionGeneration) return
+        try {
             wifiManager.startLocalOnlyHotspot(object : WifiManager.LocalOnlyHotspotCallback() {
                 override fun onStarted(res: WifiManager.LocalOnlyHotspotReservation?) {
                     super.onStarted(res)
+                    if (generation != sessionGeneration) {
+                        runCatching { res?.close() }
+                        return
+                    }
                     reservation = res
 
                     var ssid = "FastShare_AP"
@@ -77,19 +184,23 @@ class HotspotManager(private val context: Context) {
                     ssid = ssid.removeSurrounding("\"")
                     password = password.removeSurrounding("\"")
 
-                    var localIp = "192.168.43.1"
-                    for (i in 0 until 10) {
-                        val detected = getLocalIpAddress()
-                        if (detected.isNotEmpty() && detected != "192.168.43.1" && !detected.startsWith("127.") && !detected.startsWith("169.254.")) {
-                            localIp = detected
-                            break
+                    val finalSsid = ssid
+                    val finalPassword = password
+                    // The SoftAP interface can take a moment to get its address; poll off the main thread.
+                    Thread {
+                        var localIp = DEFAULT_GATEWAY_IP
+                        for (i in 0 until 10) {
+                            val detected = getLocalIpAddress()
+                            if (detected != DEFAULT_GATEWAY_IP && !detected.startsWith("127.") && !detected.startsWith("169.254.")) {
+                                localIp = detected
+                                break
+                            }
+                            try { Thread.sleep(100) } catch (ignored: InterruptedException) { break }
                         }
-                        if (detected == "192.168.43.1") {
-                            localIp = detected
+                        mainHandler.post {
+                            if (reservation === res) callback.onHotspotStarted(finalSsid, finalPassword, localIp)
                         }
-                        try { Thread.sleep(100) } catch (ignored: Exception) {}
-                    }
-                    callback.onHotspotStarted(ssid, password, localIp)
+                    }.start()
                 }
 
                 override fun onStopped() {
@@ -110,7 +221,7 @@ class HotspotManager(private val context: Context) {
                     }
                     callback.onHotspotFailed(errorMsg)
                 }
-            }, Handler(Looper.getMainLooper()))
+            }, mainHandler)
         } catch (e: SecurityException) {
             callback.onHotspotFailed("Permission denied: ${e.message}")
         } catch (e: Exception) {
@@ -119,28 +230,20 @@ class HotspotManager(private val context: Context) {
     }
 
     fun stopHotspot() {
+        sessionGeneration++
         try {
             reservation?.close()
         } catch (e: Exception) {
             e.printStackTrace()
         } finally {
             reservation = null
-            try {
-                if (wakeLock?.isHeld == true) wakeLock?.release()
-                wakeLock = null
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
-            try {
-                if (wifiLock?.isHeld == true) wifiLock?.release()
-                wifiLock = null
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
+            releaseWifiDirect()
+            locks?.release()
+            locks = null
         }
     }
 
-    fun isRunning(): Boolean = reservation != null
+    fun isRunning(): Boolean = reservation != null || p2pActive
 
     fun getLocalIpAddress(): String {
         try {

@@ -3,32 +3,30 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <!-- P2P Share Icon (Connected device nodes & transfer arrows) -->
-    <!-- Top-Right Node -->
+    <!-- Outgoing (send): motion streak + arrow -->
     <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M70,36 A8,8 0 1,0 70,20 A8,8 0 1,0 70,36 Z" />
-    <!-- Bottom-Right Node -->
+        android:fillColor="#96FFFFFF"
+        android:strokeColor="#96FFFFFF"
+        android:strokeWidth="2.5"
+        android:strokeLineJoin="round"
+        android:pathData="M28.3,38.5 L34.8,38.5 L32.3,47.5 L25.8,47.5 Z" />
     <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M70,88 A8,8 0 1,0 70,72 A8,8 0 1,0 70,88 Z" />
-    <!-- Left Central Node -->
+        android:fillColor="#FFFFFFFF"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="2.5"
+        android:strokeLineJoin="round"
+        android:pathData="M39.3,38.5 L65.3,38.5 L67.3,31.5 L84.1,43.0 L60.9,54.5 L62.8,47.5 L36.8,47.5 Z" />
+    <!-- Incoming (receive): the same shape rotated 180 degrees -->
     <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M38,62 A9,9 0 1,0 38,44 A9,9 0 1,0 38,62 Z" />
-    <!-- Connecting transfer lines -->
+        android:fillColor="#96A9C6FF"
+        android:strokeColor="#96A9C6FF"
+        android:strokeWidth="2.5"
+        android:strokeLineJoin="round"
+        android:pathData="M79.7,69.5 L73.2,69.5 L75.7,60.5 L82.2,60.5 Z" />
     <path
-        android:strokeColor="#FFFFFF"
-        android:strokeWidth="5"
-        android:strokeLineCap="round"
-        android:pathData="M44,49 L64,32" />
-    <path
-        android:strokeColor="#FFFFFF"
-        android:strokeWidth="5"
-        android:strokeLineCap="round"
-        android:pathData="M44,57 L64,76" />
-    <!-- Center pulse dot -->
-    <path
-        android:fillColor="#FF2A55"
-        android:pathData="M38,56 A3,3 0 1,0 38,50 A3,3 0 1,0 38,56 Z" />
+        android:fillColor="#FFA9C6FF"
+        android:strokeColor="#FFA9C6FF"
+        android:strokeWidth="2.5"
+        android:strokeLineJoin="round"
+        android:pathData="M68.7,69.5 L42.7,69.5 L40.7,76.5 L23.9,65.0 L47.1,53.5 L45.2,60.5 L71.2,60.5 Z" />
 </vector>

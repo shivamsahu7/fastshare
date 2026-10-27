@@ -1,5 +1,6 @@
 package com.fastshare.app.ui.screens
 
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -24,9 +25,11 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.fastshare.app.R
 import com.fastshare.app.ui.theme.*
 
 @Composable
@@ -59,29 +62,21 @@ fun HomeScreen(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.weight(1f)
             ) {
-                // P2P Share Logo Badge
+                // App logo (same mark as the launcher icon)
                 Box(
                     modifier = Modifier
                         .size(44.dp)
-                        .clip(CircleShape)
-                        .background(RubyGradient)
-                        .padding(2.dp),
+                        .clip(RoundedCornerShape(13.dp))
+                        .background(
+                            Brush.linearGradient(listOf(Color(0xFF3F82F4), Color(0xFF1B3A9A)))
+                        ),
                     contentAlignment = Alignment.Center
                 ) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .clip(CircleShape)
-                            .background(SurfaceCard),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Share,
-                            contentDescription = "Share Logo",
-                            tint = RubyRedLight,
-                            modifier = Modifier.size(24.dp)
-                        )
-                    }
+                    Image(
+                        painter = painterResource(id = R.drawable.ic_logo_mark),
+                        contentDescription = "FastShare logo",
+                        modifier = Modifier.width(26.dp)
+                    )
                 }
 
                 Spacer(modifier = Modifier.width(12.dp))
@@ -168,13 +163,12 @@ fun HomeScreen(
                         .background(
                             Brush.linearGradient(
                                 colors = listOf(
-                                    Color(0xFFFF3366), // Vivid Rose
-                                    Color(0xFFE11D48), // Electric Crimson
-                                    Color(0xFFBE123C)  // Deep Ruby
+                                    RubyRed,
+                                    RubyRedDark
                                 )
                             )
                         )
-                        .border(1.5.dp, Color(0xFFFF85A1).copy(alpha = 0.6f), RoundedCornerShape(26.dp))
+                        .border(1.dp, Color.White.copy(alpha = 0.12f), RoundedCornerShape(26.dp))
                         .padding(24.dp)
                 ) {
                     // Background watermark share icon

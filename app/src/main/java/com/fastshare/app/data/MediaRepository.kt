@@ -4,12 +4,16 @@ import android.content.ContentUris
 import android.content.Context
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
-import android.graphics.drawable.Drawable
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.core.graphics.drawable.toBitmap
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.ContactsContract
 import android.provider.MediaStore
+import android.webkit.MimeTypeMap
+import com.fastshare.app.util.sanitizeFileName
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -22,7 +26,7 @@ data class InstalledAppItem(
     val packageName: String,
     val size: Long,
     val sourceDir: String,
-    val icon: Drawable?
+    val icon: ImageBitmap?
 )
 
 data class MediaItem(
@@ -142,7 +146,12 @@ class MediaRepository(private val context: Context) {
                     val apkFile = File(appInfo.sourceDir)
                     if (apkFile.exists()) {
                         val name = pm.getApplicationLabel(appInfo).toString()
-                        val icon = try { pm.getApplicationIcon(appInfo) } catch (e: Exception) { null }
+                        // Rasterize once at display size; drawing full adaptive icons while scrolling is costly.
+                        val icon = try {
+                            pm.getApplicationIcon(appInfo).toBitmap(APP_ICON_PX, APP_ICON_PX).asImageBitmap()
+                        } catch (e: Exception) {
+                            null
+                        }
                         apps.add(
                             InstalledAppItem(
                                 name = name,
@@ -227,7 +236,7 @@ class MediaRepository(private val context: Context) {
                 scanImagesFromDirectory(f, result)
             } else if (f.isFile) {
                 val ext = f.extension.lowercase()
-                if (ext in listOf("jpg", "jpeg", "png", "webp", "gif", "bmp", "heic")) {
+                if (ext in IMAGE_EXTENSIONS) {
                     result.add(
                         MediaItem(
                             id = f.hashCode().toLong(),
@@ -368,7 +377,7 @@ class MediaRepository(private val context: Context) {
                 scanVideosFromDirectory(f, result)
             } else if (f.isFile) {
                 val ext = f.extension.lowercase()
-                if (ext in listOf("mp4", "mkv", "3gp", "webm", "avi", "mov", "ts")) {
+                if (ext in VIDEO_EXTENSIONS) {
                     result.add(
                         VideoItem(
                             id = f.hashCode().toLong(),
@@ -447,7 +456,7 @@ class MediaRepository(private val context: Context) {
                 scanAudiosFromDirectory(f, result)
             } else if (f.isFile) {
                 val ext = f.extension.lowercase()
-                if (ext in listOf("mp3", "m4a", "aac", "wav", "flac", "ogg", "opus")) {
+                if (ext in AUDIO_EXTENSIONS) {
                     result.add(
                         AudioItem(
                             id = f.hashCode().toLong(),
@@ -540,13 +549,16 @@ class MediaRepository(private val context: Context) {
     // -------------------------------------------------------------------------------------
     // Categorized Files (Documents, Ebooks, Apks, Archives, Big Files)
     // -------------------------------------------------------------------------------------
+    private fun matchesCategory(type: CategorizedFileType, ext: String, size: Long): Boolean = when (type) {
+        CategorizedFileType.DOCUMENTS -> ext in DOC_EXTENSIONS
+        CategorizedFileType.EBOOKS -> ext in EBOOK_EXTENSIONS
+        CategorizedFileType.APKS -> ext == "apk"
+        CategorizedFileType.ARCHIVES -> ext in ARCHIVE_EXTENSIONS
+        CategorizedFileType.BIG_FILES -> size >= MIN_BIG_FILE_SIZE
+    }
+
     suspend fun loadCategorizedFiles(type: CategorizedFileType): List<CategorizedFileInfo> = withContext(Dispatchers.IO) {
         val items = mutableListOf<CategorizedFileInfo>()
-        val docExtensions = setOf("pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "wps", "csv", "rtf")
-        val ebookExtensions = setOf("txt", "epub", "mobi", "chm", "ebk", "umd")
-        val apkExtensions = setOf("apk")
-        val archiveExtensions = setOf("zip", "rar", "7z", "tar", "gz", "iso")
-        val minBigFileSize = 50 * 1024 * 1024L // 50MB
 
         val projection = arrayOf(
             MediaStore.Files.FileColumns._ID,
@@ -570,27 +582,21 @@ class MediaRepository(private val context: Context) {
                 val sizeCol = cursor.getColumnIndex(MediaStore.Files.FileColumns.SIZE)
                 val dateCol = cursor.getColumnIndex(MediaStore.Files.FileColumns.DATE_MODIFIED)
 
+                if (dataCol < 0) return@use
                 while (cursor.moveToNext()) {
-                    val path = if (dataCol >= 0) cursor.getString(dataCol) else null ?: continue
+                    val path = cursor.getString(dataCol) ?: continue
+                    val ext = path.substringAfterLast('/').substringAfterLast('.', "").lowercase()
+                    val cursorSize = if (sizeCol >= 0) cursor.getLong(sizeCol) else -1L
+                    // Filter on cursor data first; stat() only the rows that actually match.
+                    if (!matchesCategory(type, ext, cursorSize)) continue
+
                     val file = File(path)
-                    if (!file.exists() || file.isDirectory) continue
+                    if (!file.isFile) continue
 
-                    val size = if (sizeCol >= 0) cursor.getLong(sizeCol) else file.length()
-                    val name = if (nameCol >= 0) cursor.getString(nameCol) ?: file.name else file.name
-                    val ext = file.extension.lowercase()
-
-                    val matches = when (type) {
-                        CategorizedFileType.DOCUMENTS -> ext in docExtensions
-                        CategorizedFileType.EBOOKS -> ext in ebookExtensions
-                        CategorizedFileType.APKS -> ext in apkExtensions
-                        CategorizedFileType.ARCHIVES -> ext in archiveExtensions
-                        CategorizedFileType.BIG_FILES -> size >= minBigFileSize
-                    }
-
-                    if (matches) {
-                        val dateModified = if (dateCol >= 0) cursor.getLong(dateCol) * 1000 else file.lastModified()
-                        items.add(CategorizedFileInfo(file, name, size, dateModified, ext))
-                    }
+                    val size = if (cursorSize >= 0) cursorSize else file.length()
+                    val name = (if (nameCol >= 0) cursor.getString(nameCol) else null) ?: file.name
+                    val dateModified = if (dateCol >= 0) cursor.getLong(dateCol) * 1000 else file.lastModified()
+                    items.add(CategorizedFileInfo(file, name, size, dateModified, ext))
                 }
             }
         } catch (e: Exception) {
@@ -607,37 +613,20 @@ class MediaRepository(private val context: Context) {
                 dir.listFiles()?.forEach { file ->
                     if (file.isFile && !file.name.startsWith(".")) {
                         val ext = file.extension.lowercase()
-                        val matches = when (type) {
-                            CategorizedFileType.DOCUMENTS -> ext in docExtensions
-                            CategorizedFileType.EBOOKS -> ext in ebookExtensions
-                            CategorizedFileType.APKS -> ext in apkExtensions
-                            CategorizedFileType.ARCHIVES -> ext in archiveExtensions
-                            CategorizedFileType.BIG_FILES -> file.length() >= minBigFileSize
-                        }
-                        if (matches && items.none { it.file.absolutePath == file.absolutePath }) {
-                            items.add(CategorizedFileInfo(file, file.name, file.length(), file.lastModified(), ext))
+                        val size = file.length()
+                        if (matchesCategory(type, ext, size)) {
+                            items.add(CategorizedFileInfo(file, file.name, size, file.lastModified(), ext))
                         }
                     }
                 }
             }
         }
 
-        items.sortedByDescending { it.lastModified }
+        items.distinctBy { it.file.absolutePath }.sortedByDescending { it.lastModified }
     }
 
     suspend fun getCategorizedCounts(): Map<CategorizedFileType, Int> = withContext(Dispatchers.IO) {
-        val counts = mutableMapOf(
-            CategorizedFileType.DOCUMENTS to 0,
-            CategorizedFileType.EBOOKS to 0,
-            CategorizedFileType.APKS to 0,
-            CategorizedFileType.ARCHIVES to 0,
-            CategorizedFileType.BIG_FILES to 0
-        )
-        val docExtensions = setOf("pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "wps", "csv", "rtf")
-        val ebookExtensions = setOf("txt", "epub", "mobi", "chm", "ebk", "umd")
-        val apkExtensions = setOf("apk")
-        val archiveExtensions = setOf("zip", "rar", "7z", "tar", "gz", "iso")
-        val minBigFileSize = 50 * 1024 * 1024L
+        val counts = IntArray(CategorizedFileType.entries.size)
 
         val projection = arrayOf(
             MediaStore.Files.FileColumns.DISPLAY_NAME,
@@ -654,19 +643,16 @@ class MediaRepository(private val context: Context) {
                     val name = if (nameCol >= 0) cursor.getString(nameCol) ?: "" else ""
                     val size = if (sizeCol >= 0) cursor.getLong(sizeCol) else 0L
                     val ext = name.substringAfterLast('.', "").lowercase()
-
-                    if (ext in docExtensions) counts[CategorizedFileType.DOCUMENTS] = counts[CategorizedFileType.DOCUMENTS]!! + 1
-                    if (ext in ebookExtensions) counts[CategorizedFileType.EBOOKS] = counts[CategorizedFileType.EBOOKS]!! + 1
-                    if (ext in apkExtensions) counts[CategorizedFileType.APKS] = counts[CategorizedFileType.APKS]!! + 1
-                    if (ext in archiveExtensions) counts[CategorizedFileType.ARCHIVES] = counts[CategorizedFileType.ARCHIVES]!! + 1
-                    if (size >= minBigFileSize) counts[CategorizedFileType.BIG_FILES] = counts[CategorizedFileType.BIG_FILES]!! + 1
+                    for (type in CategorizedFileType.entries) {
+                        if (matchesCategory(type, ext, size)) counts[type.ordinal]++
+                    }
                 }
             }
         } catch (e: Exception) {
             e.printStackTrace()
         }
 
-        counts
+        CategorizedFileType.entries.associateWith { counts[it.ordinal] }
     }
 
     // -------------------------------------------------------------------------------------
@@ -680,7 +666,8 @@ class MediaRepository(private val context: Context) {
                 if (f.name.startsWith(".")) continue // Skip hidden system files
 
                 val isDir = f.isDirectory
-                val subCount = if (isDir) (f.listFiles()?.size ?: 0) else 0
+                // list() returns names only, much cheaper than allocating a File per child
+                val subCount = if (isDir) (f.list()?.size ?: 0) else 0
                 val size = if (isDir) 0L else f.length()
                 val ext = if (isDir) "" else f.extension.lowercase()
 
@@ -753,18 +740,18 @@ class MediaRepository(private val context: Context) {
             END:VCARD
         """.trimIndent()
 
-        val safeName = contact.name.replace(Regex("[^a-zA-Z0-9_.-]"), "_")
+        val fileName = contactVcfName(contact)
         val cacheDir = File(context.cacheDir, "contacts")
         if (!cacheDir.exists()) cacheDir.mkdirs()
-        val vcfFile = File(cacheDir, "$safeName.vcf")
+        val vcfFile = File(cacheDir, fileName)
 
         FileOutputStream(vcfFile).use { it.write(vcard.toByteArray()) }
 
         SharedFileItem(
             id = UUID.randomUUID().toString(),
             uri = Uri.fromFile(vcfFile),
-            name = "$safeName.vcf",
-            relativePath = "$safeName.vcf",
+            name = fileName,
+            relativePath = fileName,
             size = vcfFile.length(),
             mimeType = "text/x-vcard"
         )
@@ -772,7 +759,7 @@ class MediaRepository(private val context: Context) {
 
     fun convertAppToSharedFile(app: InstalledAppItem): SharedFileItem {
         val apkFile = File(app.sourceDir)
-        val cleanName = "${app.name.replace(Regex("[^a-zA-Z0-9_.-]"), "_")}.apk"
+        val cleanName = appApkName(app)
         return SharedFileItem(
             id = UUID.randomUUID().toString(),
             uri = Uri.fromFile(apkFile),
@@ -834,20 +821,24 @@ class MediaRepository(private val context: Context) {
     }
 
     private fun getMimeTypeFromExtension(ext: String): String {
-        return when (ext.lowercase()) {
-            "pdf" -> "application/pdf"
-            "zip" -> "application/zip"
-            "apk" -> "application/vnd.android.package-archive"
-            "jpg", "jpeg" -> "image/jpeg"
-            "png" -> "image/png"
-            "webp" -> "image/webp"
-            "mp4" -> "video/mp4"
-            "mkv" -> "video/x-matroska"
-            "mp3" -> "audio/mpeg"
-            "wav" -> "audio/wav"
-            "txt" -> "text/plain"
-            "doc", "docx" -> "application/msword"
-            else -> "application/octet-stream"
-        }
+        val lower = ext.lowercase()
+        if (lower == "apk") return "application/vnd.android.package-archive"
+        return MimeTypeMap.getSingleton().getMimeTypeFromExtension(lower) ?: "application/octet-stream"
+    }
+
+    companion object {
+        private val DOC_EXTENSIONS = setOf("pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "wps", "csv", "rtf")
+        private val EBOOK_EXTENSIONS = setOf("txt", "epub", "mobi", "chm", "ebk", "umd")
+        private val ARCHIVE_EXTENSIONS = setOf("zip", "rar", "7z", "tar", "gz", "iso")
+        private val IMAGE_EXTENSIONS = setOf("jpg", "jpeg", "png", "webp", "gif", "bmp", "heic")
+        private val VIDEO_EXTENSIONS = setOf("mp4", "mkv", "3gp", "webm", "avi", "mov", "ts")
+        private val AUDIO_EXTENSIONS = setOf("mp3", "m4a", "aac", "wav", "flac", "ogg", "opus")
+        private const val MIN_BIG_FILE_SIZE = 50 * 1024 * 1024L
+        private const val APP_ICON_PX = 144
+
+        /** File name used when a contact is exported, so selection state can be matched without exporting. */
+        fun contactVcfName(contact: ContactItem): String = "${sanitizeFileName(contact.name)}.vcf"
+
+        fun appApkName(app: InstalledAppItem): String = "${sanitizeFileName(app.name)}.apk"
     }
 }

@@ -64,6 +64,9 @@ enum class ReceiveMode {
     MANUAL_INPUT
 }
 
+/** Polls run every ~1.5s; tolerate ~30s of hiccups (e.g. Wi-Fi power-save while locked). */
+private const val MAX_CONSECUTIVE_POLL_ERRORS = 12
+
 @Composable
 fun ReceiveScreen(
     wifiConnector: WifiConnector,
@@ -81,6 +84,10 @@ fun ReceiveScreen(
     var transferState by remember { mutableStateOf<TransferState>(TransferState.Idle) }
     var uploadState by remember { mutableStateOf<TransferState>(TransferState.Idle) }
     var showTransferringSheet by remember { mutableStateOf(false) }
+    val isTransferringNow = transferState is TransferState.Transferring || uploadState is TransferState.Transferring
+    LaunchedEffect(isTransferringNow) {
+        if (isTransferringNow) showTransferringSheet = true
+    }
     val receiverTransferRecords = remember { mutableStateListOf<TransferRecord>() }
 
     // Server connection details
@@ -186,27 +193,23 @@ fun ReceiveScreen(
 
     LaunchedEffect(connectedServerUrl) {
         if (connectedServerUrl.isNotEmpty()) {
+            // Keep the session alive (CPU + Wi-Fi) while the screen is locked.
+            TransferService.start(
+                context,
+                title = "FastShare: Connected",
+                message = "Connected to sender. Screen can be locked safely."
+            )
             while (connectedServerUrl.isNotEmpty()) {
                 delay(5000)
-                try {
-                    val pingUrl = java.net.URL("$connectedServerUrl/ping")
-                    val conn = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && wifiConnector.activeNetwork != null) {
-                        wifiConnector.activeNetwork!!.openConnection(pingUrl) as java.net.HttpURLConnection
-                    } else {
-                        pingUrl.openConnection() as java.net.HttpURLConnection
-                    }
-                    conn.connectTimeout = 2500
-                    conn.readTimeout = 2500
-                    conn.requestMethod = "GET"
-                    conn.setRequestProperty("x-device-name", "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}".trim())
-                    val code = conn.responseCode
-                    if (code == 410) {
-                        withContext(Dispatchers.Main) {
-                            handlePeerDisconnected()
-                        }
-                        break
-                    }
-                } catch (ignored: Exception) {}
+                val url = connectedServerUrl
+                if (url.isEmpty()) break
+                val code = withContext(Dispatchers.IO) {
+                    wifiConnector.ping(url, "${Build.MANUFACTURER} ${Build.MODEL}".trim())
+                }
+                if (code == 410) {
+                    handlePeerDisconnected()
+                    break
+                }
             }
         }
     }
@@ -247,31 +250,10 @@ fun ReceiveScreen(
                                     progress = progress
                                 )
 
-                                val existingIndex = receiverTransferRecords.indexOfFirst {
-                                    it.name == currentFileName && it.direction == TransferDirection.RECEIVING
-                                }
-                                if (existingIndex >= 0) {
-                                    val cur = receiverTransferRecords[existingIndex]
-                                    receiverTransferRecords[existingIndex] = cur.copy(
-                                        status = TransferItemStatus.TRANSFERRING,
-                                        bytesTransferred = currentFileBytes,
-                                        progress = progress,
-                                        speedMbPerSec = speedMbPerSec
-                                    )
-                                } else {
-                                    receiverTransferRecords.add(
-                                        0,
-                                        TransferRecord(
-                                            name = currentFileName,
-                                            size = currentFileSize,
-                                            direction = TransferDirection.RECEIVING,
-                                            status = TransferItemStatus.TRANSFERRING,
-                                            bytesTransferred = currentFileBytes,
-                                            progress = progress,
-                                            speedMbPerSec = speedMbPerSec
-                                        )
-                                    )
-                                }
+                                upsertProgressRecord(
+                                    receiverTransferRecords, TransferDirection.RECEIVING,
+                                    currentFileName, currentFileBytes, currentFileSize, speedMbPerSec
+                                )
                             }
 
                             override fun onFileDownloaded(fileName: String, fileSize: Long, filePath: String) {
@@ -340,7 +322,7 @@ fun ReceiveScreen(
                                         errorMessage = message
                                     )
                                 }
-                                if (consecutiveErrors >= 5) {
+                                if (consecutiveErrors >= MAX_CONSECUTIVE_POLL_ERRORS) {
                                     coroutineScope.launch(Dispatchers.Main) {
                                         handlePeerDisconnected()
                                     }
@@ -350,7 +332,7 @@ fun ReceiveScreen(
                     )
                 } catch (e: Exception) {
                     consecutiveErrors++
-                    if (consecutiveErrors >= 5) {
+                    if (consecutiveErrors >= MAX_CONSECUTIVE_POLL_ERRORS) {
                         coroutineScope.launch(Dispatchers.Main) {
                             handlePeerDisconnected()
                         }
@@ -467,6 +449,12 @@ fun ReceiveScreen(
 
                         if (resolvedUrl != null) {
                             withContext(Dispatchers.Main) {
+                                // New connection: drop the previous session's finished/failed rows.
+                                receiverTransferRecords.removeAll {
+                                    it.status == TransferItemStatus.COMPLETED || it.status == TransferItemStatus.FAILED
+                                }
+                                transferState = TransferState.Idle
+                                uploadState = TransferState.Idle
                                 isHandshakeConfirmed = true
                                 connectedServerUrl = resolvedUrl
                                 startDownload(resolvedUrl)
@@ -542,18 +530,10 @@ fun ReceiveScreen(
                             progress = progress
                         )
 
-                        val existingIndex = receiverTransferRecords.indexOfFirst {
-                            it.name == currentFileName && it.direction == TransferDirection.SENDING
-                        }
-                        if (existingIndex >= 0) {
-                            val cur = receiverTransferRecords[existingIndex]
-                            receiverTransferRecords[existingIndex] = cur.copy(
-                                status = TransferItemStatus.TRANSFERRING,
-                                bytesTransferred = currentFileBytes,
-                                progress = progress,
-                                speedMbPerSec = speedMbPerSec
-                            )
-                        }
+                        upsertProgressRecord(
+                            receiverTransferRecords, TransferDirection.SENDING,
+                            currentFileName, currentFileBytes, currentFileSize, speedMbPerSec
+                        )
                     }
 
                     override fun onFileUploaded(fileName: String, fileIndex: Int, totalFiles: Int) {
@@ -571,7 +551,6 @@ fun ReceiveScreen(
                     }
 
                     override fun onBatchSuccess(totalFiles: Int, totalBytes: Long) {
-                        TransferService.stop(context)
                         uploadState = TransferState.Completed(
                             title = "Upload to Host",
                             fileCount = totalFiles,
@@ -614,7 +593,10 @@ fun ReceiveScreen(
 
     DisposableEffect(Unit) {
         onDispose {
-            wifiConnector.disconnect()
+            // Leaving the screen ends the session: tell the sender before Wi-Fi drops.
+            isDownloadLoopActive = false
+            wifiConnector.disconnectFromPeer(connectedServerUrl)
+            TransferService.stop(context)
             activity?.window?.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         }
     }
@@ -649,21 +631,8 @@ fun ReceiveScreen(
                 fileDownloader.clearSession()
                 val targetUrl = connectedServerUrl
                 connectedServerUrl = ""
-                coroutineScope.launch(kotlinx.coroutines.Dispatchers.IO) {
-                    if (targetUrl.isNotEmpty()) {
-                        try {
-                            val discUrl = java.net.URL("$targetUrl/disconnect")
-                            val conn = discUrl.openConnection() as java.net.HttpURLConnection
-                            conn.connectTimeout = 1500
-                            conn.readTimeout = 1500
-                            conn.requestMethod = "GET"
-                            conn.responseCode
-                        } catch (ignored: Exception) {}
-                    }
-                    try {
-                        wifiConnector.disconnect()
-                    } catch (ignored: Exception) {}
-                }
+                isHandshakeConfirmed = false
+                wifiConnector.disconnectFromPeer(targetUrl)
                 TransferService.stop(context)
                 transferState = TransferState.Idle
                 uploadState = TransferState.Idle
@@ -1486,7 +1455,8 @@ fun ReceiveScreen(
                                 apps = appsList,
                                 selectedItems = selectedUploadItems,
                                 onToggle = { app ->
-                                    val existing = selectedUploadItems.values.firstOrNull { it.relativePath == "${app.name}.apk" }
+                                    val uri = appUri(app)
+                                    val existing = selectedUploadItems.values.firstOrNull { it.uri == uri }
                                     if (existing != null) {
                                         selectedUploadItems.remove(existing.id)
                                     } else {
@@ -1516,30 +1486,7 @@ fun ReceiveScreen(
                                             selectedUploadItems[item.id] = item
                                         }
                                     },
-                                    onToggleDay = { dayGroup ->
-                                        val allDaySelected = dayGroup.photos.isNotEmpty() && dayGroup.photos.all { photo ->
-                                            selectedUploadItems.values.any { it.uri == photo.uri }
-                                        }
-                                        if (allDaySelected) {
-                                            val urisToRemove = dayGroup.photos.map { it.uri }.toSet()
-                                            val toRemoveIds = selectedUploadItems.filter { it.value.uri in urisToRemove }.keys.toList()
-                                            toRemoveIds.forEach { selectedUploadItems.remove(it) }
-                                        } else {
-                                            dayGroup.photos.forEach { photo ->
-                                                if (!selectedUploadItems.values.any { it.uri == photo.uri }) {
-                                                    val item = SharedFileItem(
-                                                        id = UUID.randomUUID().toString(),
-                                                        uri = photo.uri,
-                                                        name = photo.name,
-                                                        relativePath = photo.name,
-                                                        size = photo.size,
-                                                        mimeType = photo.mimeType
-                                                    )
-                                                    selectedUploadItems[item.id] = item
-                                                }
-                                            }
-                                        }
-                                    }
+                                    onToggleDay = { dayGroup -> toggleDayPhotos(selectedUploadItems, dayGroup) }
                                 )
                             }
 
@@ -1624,7 +1571,8 @@ fun ReceiveScreen(
                                     selectedItems = selectedUploadItems,
                                     onToggle = { contact ->
                                         coroutineScope.launch {
-                                            val existing = selectedUploadItems.values.firstOrNull { it.name.startsWith(contact.name) }
+                                            val vcfName = MediaRepository.contactVcfName(contact)
+                                            val existing = selectedUploadItems.values.firstOrNull { it.name == vcfName }
                                             if (existing != null) {
                                                 selectedUploadItems.remove(existing.id)
                                             } else {
@@ -1646,14 +1594,18 @@ fun ReceiveScreen(
                     enter = slideInVertically(initialOffsetY = { it }) + fadeIn(),
                     exit = slideOutVertically(targetOffsetY = { it }) + fadeOut()
                 ) {
+                    val miniBarBelow = transferState is TransferState.Transferring ||
+                        uploadState is TransferState.Transferring ||
+                        receiverTransferRecords.isNotEmpty()
                     Surface(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(12.dp),
-                        color = SurfaceElevated.copy(alpha = 0.98f),
-                        shape = RoundedCornerShape(22.dp),
-                        shadowElevation = 20.dp,
-                        border = androidx.compose.foundation.BorderStroke(1.5.dp, BorderSubtle)
+                            .then(if (miniBarBelow) Modifier else Modifier.navigationBarsPadding())
+                            .padding(start = 14.dp, end = 14.dp, top = 8.dp, bottom = if (miniBarBelow) 6.dp else 20.dp),
+                        color = SurfaceElevated,
+                        shape = RoundedCornerShape(16.dp),
+                        shadowElevation = 4.dp,
+                        border = androidx.compose.foundation.BorderStroke(1.dp, BorderSubtle)
                     ) {
                         Row(
                             modifier = Modifier
@@ -1665,8 +1617,8 @@ fun ReceiveScreen(
                             Column {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
                                     Text(
-                                        text = "⚡ $totalSelectedCount items",
-                                        fontWeight = FontWeight.ExtraBold,
+                                        text = "$totalSelectedCount items",
+                                        fontWeight = FontWeight.Bold,
                                         color = TextPrimary,
                                         fontSize = 15.sp
                                     )
@@ -1679,7 +1631,7 @@ fun ReceiveScreen(
                                 }
                                 Text(
                                     text = "Clear selection",
-                                    color = Color(0xFFEF4444),
+                                    color = TextSecondary,
                                     fontSize = 11.sp,
                                     fontWeight = FontWeight.Medium,
                                     modifier = Modifier.clickable { selectedUploadItems.clear() }
@@ -1702,8 +1654,8 @@ fun ReceiveScreen(
                                 )
                                 Spacer(modifier = Modifier.width(8.dp))
                                 Text(
-                                    text = "SEND TO HOST ($totalSelectedCount)",
-                                    fontWeight = FontWeight.ExtraBold,
+                                    text = "Send ($totalSelectedCount)",
+                                    fontWeight = FontWeight.SemiBold,
                                     fontSize = 14.sp
                                 )
                             }
@@ -1721,18 +1673,19 @@ fun ReceiveScreen(
                 uploadState is TransferState.Transferring -> uploadState as TransferState.Transferring
                 else -> null
             }
+            val curOverallProgress = curActive?.let {
+                if (it.overallTotalBytes > 0) (it.overallBytes.toFloat() / it.overallTotalBytes).coerceIn(0f, 1f) else it.progress
+            } ?: 0f
             Surface(
                 onClick = { showTransferringSheet = true },
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 14.dp, vertical = 6.dp),
-                shape = RoundedCornerShape(18.dp),
-                color = SurfaceElevated.copy(alpha = 0.98f),
-                shadowElevation = 8.dp,
-                border = androidx.compose.foundation.BorderStroke(
-                    1.5.dp,
-                    if (curActive != null) RubyRedLight else BorderSubtle
-                )
+                    .navigationBarsPadding()
+                    .padding(start = 14.dp, end = 14.dp, top = 6.dp, bottom = 20.dp),
+                shape = RoundedCornerShape(16.dp),
+                color = SurfaceElevated,
+                shadowElevation = 4.dp,
+                border = androidx.compose.foundation.BorderStroke(1.dp, BorderSubtle)
             ) {
                 Row(
                     modifier = Modifier
@@ -1745,14 +1698,14 @@ fun ReceiveScreen(
                         contentAlignment = Alignment.Center
                     ) {
                         CircularProgressIndicator(
-                            progress = { curActive?.progress ?: 0f },
-                            color = RubyRedLight,
+                            progress = { curOverallProgress },
+                            color = RubyRed,
                             trackColor = BorderSubtle,
                             strokeWidth = 3.5.dp,
                             modifier = Modifier.fillMaxSize()
                         )
                         Text(
-                            text = "${((curActive?.progress ?: 0f) * 100).toInt()}%",
+                            text = "${(curOverallProgress * 100).toInt()}%",
                             fontSize = 9.sp,
                             fontWeight = FontWeight.Bold,
                             color = TextPrimary

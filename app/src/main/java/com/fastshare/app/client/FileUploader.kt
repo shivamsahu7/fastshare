@@ -2,58 +2,37 @@ package com.fastshare.app.client
 
 import android.content.Context
 import android.net.Network
-import android.net.Uri
-import android.net.wifi.WifiManager
-import android.os.Build
-import android.os.PowerManager
 import com.fastshare.app.data.SharedFileItem
 import com.fastshare.app.service.TransferService
+import com.fastshare.app.util.HighSpeedSocketFactory
+import com.fastshare.app.util.NOTIFICATION_INTERVAL_MS
+import com.fastshare.app.util.PROGRESS_INTERVAL_MS
+import com.fastshare.app.util.TRANSFER_BUFFER_SIZE
+import com.fastshare.app.util.TransferLocks
+import com.fastshare.app.util.formatSpeed
+import com.fastshare.app.util.runOnMain
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
-import okhttp3.*
-import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.MediaType
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody
 import okio.BufferedSink
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
 class FileUploader(private val context: Context) {
 
+    @Volatile
     var activeNetwork: Network? = null
 
-    private inner class HighSpeedSocketFactory : javax.net.SocketFactory() {
-        private fun getDelegate(): javax.net.SocketFactory {
-            return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && activeNetwork != null) {
-                activeNetwork!!.socketFactory
-            } else {
-                javax.net.SocketFactory.getDefault()
-            }
-        }
-
-        override fun createSocket(): java.net.Socket = configure(getDelegate().createSocket())
-        override fun createSocket(host: String?, port: Int): java.net.Socket = configure(getDelegate().createSocket(host, port))
-        override fun createSocket(host: String?, port: Int, localHost: java.net.InetAddress?, localPort: Int): java.net.Socket = configure(getDelegate().createSocket(host, port, localHost, localPort))
-        override fun createSocket(host: java.net.InetAddress?, port: Int): java.net.Socket = configure(getDelegate().createSocket(host, port))
-        override fun createSocket(address: java.net.InetAddress?, port: Int, localAddress: java.net.InetAddress?, localPort: Int): java.net.Socket = configure(getDelegate().createSocket(address, port, localAddress, localPort))
-
-        private fun configure(socket: java.net.Socket): java.net.Socket {
-            try {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    activeNetwork?.bindSocket(socket)
-                }
-                socket.tcpNoDelay = true
-                socket.sendBufferSize = 1024 * 1024 // 1 MB high-speed TCP window
-                socket.receiveBufferSize = 1024 * 1024
-                socket.trafficClass = 0x10 // IPTOS_LOWDELAY
-            } catch (ignored: Exception) {}
-            return socket
-        }
-    }
-
     private val client = OkHttpClient.Builder()
-        .socketFactory(HighSpeedSocketFactory())
+        .socketFactory(HighSpeedSocketFactory { activeNetwork })
         .connectTimeout(30, TimeUnit.SECONDS)
-        .writeTimeout(0, TimeUnit.SECONDS) // No timeout for large uploads
+        .writeTimeout(0, TimeUnit.SECONDS)
         .readTimeout(120, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
         .build()
@@ -75,159 +54,111 @@ class FileUploader(private val context: Context) {
         fun onError(message: String)
     }
 
+    private class MainThreadCallback(private val delegate: UploadCallback) : UploadCallback {
+        override fun onProgress(
+            currentFileName: String, currentFileIndex: Int, totalFiles: Int, currentFileBytes: Long,
+            currentFileSize: Long, overallBytes: Long, overallTotalBytes: Long, speedMbPerSec: Double, progress: Float
+        ) = runOnMain {
+            delegate.onProgress(
+                currentFileName, currentFileIndex, totalFiles, currentFileBytes,
+                currentFileSize, overallBytes, overallTotalBytes, speedMbPerSec, progress
+            )
+        }
+        override fun onFileUploaded(fileName: String, fileIndex: Int, totalFiles: Int) =
+            runOnMain { delegate.onFileUploaded(fileName, fileIndex, totalFiles) }
+        override fun onBatchSuccess(totalFiles: Int, totalBytes: Long) =
+            runOnMain { delegate.onBatchSuccess(totalFiles, totalBytes) }
+        override fun onError(message: String) = runOnMain { delegate.onError(message) }
+    }
+
     suspend fun uploadBatch(
         serverBaseUrl: String,
         items: List<SharedFileItem>,
         callback: UploadCallback
     ) = withContext(Dispatchers.IO) {
+        val cb = MainThreadCallback(callback)
         if (items.isEmpty()) {
-            callback.onError("No files selected for upload")
+            cb.onError("No files selected for upload")
             return@withContext
         }
 
-        try {
+        runCatching {
             TransferService.start(
                 context,
                 title = "FastShare: Sending to Host",
                 message = "Uploading files in background. Screen can be locked safely."
             )
-        } catch (e: Exception) {
-            e.printStackTrace()
         }
 
-        val powerManager = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
-        val wakeLock = powerManager?.newWakeLock(
-            PowerManager.PARTIAL_WAKE_LOCK,
-            "FastShare:FileUploaderWakeLock"
-        )?.apply {
-            setReferenceCounted(false)
-            acquire(2 * 60 * 60 * 1000L) // 2 hours max
-        }
-
-        val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
-        val wifiLock = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-            wifiManager?.createWifiLock(
-                WifiManager.WIFI_MODE_FULL_LOW_LATENCY,
-                "FastShare:FileUploaderWifiLock"
-            )?.apply {
-                setReferenceCounted(false)
-                acquire()
-            }
-        } else {
-            @Suppress("DEPRECATION")
-            wifiManager?.createWifiLock(
-                WifiManager.WIFI_MODE_FULL_HIGH_PERF,
-                "FastShare:FileUploaderWifiLock"
-            )?.apply {
-                setReferenceCounted(false)
-                acquire()
-            }
-        }
-
+        val locks = TransferLocks(context, "FileUploader")
         val totalFiles = items.size
         val overallTotalBytes = items.sumOf { it.size }
         var overallBytesSent = 0L
+        var lastNotificationTime = 0L
+        val uploadUrl = "${serverBaseUrl.trimEnd('/')}/upload".toHttpUrl()
 
         try {
-            val normalizedBaseUrl = if (serverBaseUrl.endsWith("/")) serverBaseUrl.dropLast(1) else serverBaseUrl
-            val uploadUrl = "$normalizedBaseUrl/upload"
-
             for ((index, item) in items.withIndex()) {
                 val fileIndex = index + 1
-                var fileUploadedSuccessfully = false
-                var attempts = 0
-                val maxAttempts = 3
                 var lastException: Exception? = null
+                var uploaded = false
 
-                while (!fileUploadedSuccessfully && attempts < maxAttempts) {
-                    attempts++
+                for (attempt in 1..MAX_ATTEMPTS) {
                     try {
-                        var fileBytesSent = 0L
-                        val startTime = System.currentTimeMillis()
-                        var lastUpdateTime = startTime
-
-                        val countingBody = object : RequestBody() {
-                            override fun contentType(): MediaType? = "application/octet-stream".toMediaTypeOrNull()
-                            override fun contentLength(): Long = item.size
-
-                            override fun writeTo(sink: BufferedSink) {
-                                context.contentResolver.openInputStream(item.uri)?.use { inStream ->
-                                    val buffer = ByteArray(64 * 1024)
-                                    var read: Int
-                                    while (inStream.read(buffer).also { read = it } != -1) {
-                                        sink.write(buffer, 0, read)
-                                        sink.flush()
-
-                                        fileBytesSent += read
-                                        val totalSoFar = overallBytesSent + fileBytesSent
-
-                                        val now = System.currentTimeMillis()
-                                        if (now - lastUpdateTime >= 100 || fileBytesSent >= item.size) {
-                                            val elapsedSec = (now - startTime) / 1000.0
-                                            val speed = if (elapsedSec > 0) (fileBytesSent / (1024.0 * 1024.0)) / elapsedSec else 0.0
-                                            val progress = if (overallTotalBytes > 0) totalSoFar.toFloat() / overallTotalBytes else 1f
-
-                                            callback.onProgress(
-                                                currentFileName = item.name,
-                                                currentFileIndex = fileIndex,
-                                                totalFiles = totalFiles,
-                                                currentFileBytes = fileBytesSent,
-                                                currentFileSize = item.size,
-                                                overallBytes = totalSoFar,
-                                                overallTotalBytes = overallTotalBytes,
-                                                speedMbPerSec = speed,
-                                                progress = progress.coerceIn(0f, 1f)
-                                            )
-
-                                            val percent = (progress.coerceIn(0f, 1f) * 100).toInt()
-                                            TransferService.update(
-                                                context,
-                                                title = "FastShare: Sending ($percent%)",
-                                                message = "$fileIndex/$totalFiles: ${item.name} • ${String.format("%.1f", speed)} MB/s",
-                                                progress = percent
-                                            )
-
-                                            lastUpdateTime = now
-                                        }
-                                    }
-                                } ?: throw IOException("Cannot read file: ${item.name}")
+                        val body = ProgressRequestBody(item) { fileBytesSent, speed ->
+                            val totalSoFar = overallBytesSent + fileBytesSent
+                            val progress = if (overallTotalBytes > 0) {
+                                (totalSoFar.toFloat() / overallTotalBytes).coerceIn(0f, 1f)
+                            } else 1f
+                            cb.onProgress(
+                                currentFileName = item.name,
+                                currentFileIndex = fileIndex,
+                                totalFiles = totalFiles,
+                                currentFileBytes = fileBytesSent,
+                                currentFileSize = item.size,
+                                overallBytes = totalSoFar,
+                                overallTotalBytes = overallTotalBytes,
+                                speedMbPerSec = speed,
+                                progress = progress
+                            )
+                            val now = System.currentTimeMillis()
+                            if (now - lastNotificationTime >= NOTIFICATION_INTERVAL_MS) {
+                                lastNotificationTime = now
+                                val percent = (progress * 100).toInt()
+                                TransferService.update(
+                                    context,
+                                    title = "FastShare: Sending ($percent%)",
+                                    message = "$fileIndex/$totalFiles: ${item.name} • ${formatSpeed(speed)} MB/s",
+                                    progress = percent
+                                )
                             }
                         }
 
-                        val multipartBody = MultipartBody.Builder()
-                            .setType(MultipartBody.FORM)
-                            .addFormDataPart("name", item.name)
-                            .addFormDataPart("relativePath", item.relativePath)
-                            .addFormDataPart("size", item.size.toString())
-                            .addFormDataPart("file", item.name, countingBody)
+                        val url = uploadUrl.newBuilder()
+                            .addQueryParameter("name", item.name)
+                            .addQueryParameter("relativePath", item.relativePath)
+                            .addQueryParameter("size", item.size.toString())
                             .build()
-
-                        val request = Request.Builder()
-                            .url(uploadUrl)
-                            .post(multipartBody)
-                            .build()
+                        val request = Request.Builder().url(url).post(body).build()
 
                         client.newCall(request).execute().use { response ->
                             if (!response.isSuccessful) {
                                 throw IOException("Server returned error ${response.code}: ${response.message}")
                             }
                         }
-
-                        overallBytesSent += item.size
-                        fileUploadedSuccessfully = true
+                        uploaded = true
+                        break
                     } catch (e: Exception) {
                         lastException = e
-                        if (attempts < maxAttempts) {
-                            delay(1500)
-                        }
+                        if (attempt < MAX_ATTEMPTS) delay(RETRY_DELAY_MS)
                     }
                 }
 
-                if (!fileUploadedSuccessfully) {
-                    throw lastException ?: IOException("Failed to upload ${item.name} after $maxAttempts attempts")
+                if (!uploaded) {
+                    throw lastException ?: IOException("Failed to upload ${item.name} after $MAX_ATTEMPTS attempts")
                 }
-
-                callback.onFileUploaded(item.name, fileIndex, totalFiles)
+                overallBytesSent += item.size
+                cb.onFileUploaded(item.name, fileIndex, totalFiles)
             }
 
             TransferService.update(
@@ -236,18 +167,52 @@ class FileUploader(private val context: Context) {
                 message = "Sent $totalFiles file(s) to host successfully",
                 progress = 100
             )
-
-            callback.onBatchSuccess(totalFiles, overallTotalBytes)
+            cb.onBatchSuccess(totalFiles, overallTotalBytes)
         } catch (e: Exception) {
             e.printStackTrace()
-            callback.onError(e.message ?: "Upload failed")
+            cb.onError(e.message ?: "Upload failed")
         } finally {
-            try {
-                if (wakeLock?.isHeld == true) wakeLock.release()
-            } catch (ignored: Exception) {}
-            try {
-                if (wifiLock?.isHeld == true) wifiLock.release()
-            } catch (ignored: Exception) {}
+            locks.release()
         }
+    }
+
+    /** Streams the file straight to the socket, reporting progress at most every [PROGRESS_INTERVAL_MS]. */
+    private inner class ProgressRequestBody(
+        private val item: SharedFileItem,
+        private val onProgress: (bytesSent: Long, speedMbPerSec: Double) -> Unit
+    ) : RequestBody() {
+        override fun contentType(): MediaType = OCTET_STREAM
+        override fun contentLength(): Long = item.size
+
+        override fun writeTo(sink: BufferedSink) {
+            val input = context.contentResolver.openInputStream(item.uri)
+                ?: throw IOException("Cannot read file: ${item.name}")
+            input.use { inStream ->
+                val buffer = ByteArray(TRANSFER_BUFFER_SIZE)
+                val startTime = System.currentTimeMillis()
+                var lastUpdateTime = 0L
+                var sent = 0L
+                while (true) {
+                    val read = inStream.read(buffer)
+                    if (read == -1) break
+                    sink.write(buffer, 0, read)
+                    sent += read
+
+                    val now = System.currentTimeMillis()
+                    if (now - lastUpdateTime >= PROGRESS_INTERVAL_MS || sent >= item.size) {
+                        lastUpdateTime = now
+                        val elapsedSec = (now - startTime) / 1000.0
+                        val speed = if (elapsedSec > 0) (sent / (1024.0 * 1024.0)) / elapsedSec else 0.0
+                        onProgress(sent, speed)
+                    }
+                }
+            }
+        }
+    }
+
+    private companion object {
+        const val MAX_ATTEMPTS = 3
+        const val RETRY_DELAY_MS = 1500L
+        val OCTET_STREAM = "application/octet-stream".toMediaType()
     }
 }

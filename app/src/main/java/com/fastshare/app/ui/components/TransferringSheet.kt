@@ -99,7 +99,9 @@ fun TransferringSheet(
                     0L
                 }
                 val progress = if (activeState != null) {
-                    activeState.progress
+                    if (activeState.currentFileSize > 0) {
+                        (activeState.currentFileBytes.toFloat() / activeState.currentFileSize).coerceIn(0f, 1f)
+                    } else 0f
                 } else if (isCompleted) {
                     1f
                 } else {
@@ -151,7 +153,9 @@ fun TransferringSheet(
                         direction = TransferDirection.RECEIVING,
                         status = TransferItemStatus.TRANSFERRING,
                         bytesTransferred = transferState.currentFileBytes,
-                        progress = transferState.progress,
+                        progress = if (transferState.currentFileSize > 0) {
+                            (transferState.currentFileBytes.toFloat() / transferState.currentFileSize).coerceIn(0f, 1f)
+                        } else 0f,
                         speedMbPerSec = transferState.speedMbPerSec
                     )
                 )
@@ -184,12 +188,12 @@ fun TransferringSheet(
             .background(BgVoid)
     ) {
         // ---------------------------------------------------------------------------------
-        // 1. Top Header Bar (Ruby Red Theme)
+        // 1. Top Header Bar
         // ---------------------------------------------------------------------------------
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .background(RubyRed)
+                .background(SurfaceBase)
                 .statusBarsPadding()
                 .padding(horizontal = 14.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically
@@ -201,7 +205,7 @@ fun TransferringSheet(
                 Icon(
                     imageVector = Icons.Default.KeyboardArrowDown,
                     contentDescription = "Collapse",
-                    tint = Color.White,
+                    tint = TextPrimary,
                     modifier = Modifier.size(28.dp)
                 )
             }
@@ -210,15 +214,15 @@ fun TransferringSheet(
 
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = "Transferring",
+                    text = "Transfers",
                     fontSize = 19.sp,
                     fontWeight = FontWeight.Bold,
-                    color = Color.White
+                    color = TextPrimary
                 )
                 Text(
                     text = if (unifiedList.isNotEmpty()) "${unifiedList.size} file(s) in session" else "No active transfers",
                     fontSize = 11.sp,
-                    color = Color.White.copy(alpha = 0.8f)
+                    color = TextSecondary
                 )
             }
 
@@ -230,78 +234,124 @@ fun TransferringSheet(
                 Icon(
                     imageVector = Icons.Default.Close,
                     contentDescription = "Close",
-                    tint = Color.White,
+                    tint = TextSecondary,
                     modifier = Modifier.size(22.dp)
                 )
             }
         }
 
         // ---------------------------------------------------------------------------------
-        // 2. High-Speed Bandwidth & Transferred Size Banner
+        // 2. Overall progress summary
         // ---------------------------------------------------------------------------------
-        Box(
+        val active = transferState as? TransferState.Transferring
+        val overallProgress = active?.let {
+            if (it.overallTotalBytes > 0) (it.overallBytes.toFloat() / it.overallTotalBytes).coerceIn(0f, 1f)
+            else it.progress
+        }
+        val animatedOverall by animateFloatAsState(
+            targetValue = overallProgress ?: 0f,
+            animationSpec = tween(durationMillis = 250, easing = LinearEasing),
+            label = "overallProgress"
+        )
+
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 14.dp, vertical = 10.dp)
-                .clip(RoundedCornerShape(20.dp))
-                .background(
-                    Brush.horizontalGradient(
-                        colors = listOf(RubyRed, RubyRedDark)
-                    )
-                )
-                .padding(horizontal = 20.dp, vertical = 12.dp)
+                .clip(RoundedCornerShape(16.dp))
+                .background(SurfaceCard)
+                .border(1.dp, BorderSubtle, RoundedCornerShape(16.dp))
+                .padding(horizontal = 16.dp, vertical = 14.dp)
         ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.Bottom
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = when (transferState) {
+                            is TransferState.Transferring -> "In progress"
+                            is TransferState.Completed -> "Completed"
+                            is TransferState.Error -> "Interrupted"
+                            else -> "Transferred"
+                        },
+                        fontSize = 11.sp,
+                        color = TextSecondary,
+                        fontWeight = FontWeight.Medium
+                    )
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        text = if (active != null && active.overallTotalBytes > 0) {
+                            "${formatBytes(active.overallBytes)} of ${formatBytes(active.overallTotalBytes)}"
+                        } else {
+                            totalTransferredText
+                        },
+                        fontSize = 17.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = TextPrimary
+                    )
+                }
+                if (overallProgress != null) {
+                    Text(
+                        text = "${(overallProgress * 100).toInt()}%",
+                        fontSize = 22.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = RubyRed
+                    )
+                }
+            }
+
+            if (active != null) {
+                Spacer(modifier = Modifier.height(10.dp))
+                LinearProgressIndicator(
+                    progress = { animatedOverall },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(6.dp)
+                        .clip(RoundedCornerShape(3.dp)),
+                    color = RubyRed,
+                    trackColor = SurfaceElevated,
+                    drawStopIndicator = {}
+                )
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                Text(
+                    text = if (active != null && active.totalFiles > 0) {
+                        "File ${active.currentFileIndex.coerceAtMost(active.totalFiles)} of ${active.totalFiles}"
+                    } else {
+                        "${unifiedList.count { it.status == TransferItemStatus.COMPLETED }} completed"
+                    },
+                    fontSize = 12.sp,
+                    color = TextSecondary
+                )
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(
                         imageVector = Icons.Default.Speed,
                         contentDescription = null,
-                        tint = Color.White,
-                        modifier = Modifier.size(18.dp)
+                        tint = TextSecondary,
+                        modifier = Modifier.size(14.dp)
                     )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Column {
-                        Text(
-                            text = "Speed",
-                            fontSize = 10.sp,
-                            color = Color.White.copy(alpha = 0.75f),
-                            fontWeight = FontWeight.Medium
-                        )
-                        Text(
-                            text = speedText,
-                            fontSize = 15.sp,
-                            fontWeight = FontWeight.ExtraBold,
-                            color = Color.White
-                        )
-                    }
-                }
-
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(
-                        imageVector = Icons.Default.DataUsage,
-                        contentDescription = null,
-                        tint = Color.White,
-                        modifier = Modifier.size(18.dp)
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        text = buildString {
+                            append(speedText)
+                            if (active != null && currentSpeedMb > 0.0) {
+                                val remaining = (active.overallTotalBytes - active.overallBytes).coerceAtLeast(0L)
+                                val seconds = (remaining / (currentSpeedMb * 1024 * 1024)).toLong()
+                                append(" • ")
+                                append(formatEta(seconds))
+                            }
+                        },
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = TextPrimary
                     )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Column(horizontalAlignment = Alignment.End) {
-                        Text(
-                            text = "Transferred",
-                            fontSize = 10.sp,
-                            color = Color.White.copy(alpha = 0.75f),
-                            fontWeight = FontWeight.Medium
-                        )
-                        Text(
-                            text = totalTransferredText,
-                            fontSize = 15.sp,
-                            fontWeight = FontWeight.ExtraBold,
-                            color = Color.White
-                        )
-                    }
                 }
             }
         }
@@ -321,7 +371,12 @@ fun TransferringSheet(
             } else {
                 LazyColumn(
                     modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(14.dp),
+                    contentPadding = PaddingValues(
+                        start = 14.dp,
+                        end = 14.dp,
+                        top = 4.dp,
+                        bottom = 14.dp + WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
+                    ),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     items(unifiedList, key = { "${it.id}_${it.name}_${it.direction}" }) { record ->
@@ -603,6 +658,13 @@ fun NoRecordsEmptyView() {
             color = TextMuted
         )
     }
+}
+
+private fun formatEta(seconds: Long): String = when {
+    seconds < 1 -> "almost done"
+    seconds < 60 -> "${seconds}s left"
+    seconds < 3600 -> "${seconds / 60}m ${seconds % 60}s left"
+    else -> "${seconds / 3600}h ${(seconds % 3600) / 60}m left"
 }
 
 private fun formatBytes(bytes: Long): String {
